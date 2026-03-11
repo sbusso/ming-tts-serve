@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe };
 
@@ -67,6 +68,55 @@ pub const Tokenizer = struct {
 
     /// Encode text to token IDs (no BOS/EOS added).
     pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        // Split text around special tokens, encode segments with BPE, insert special token IDs
+        var result = std.ArrayList(u32).empty;
+        errdefer result.deinit(allocator);
+
+        var pos: usize = 0;
+        while (pos < text.len) {
+            // Find the earliest special token at or after pos
+            var best_match_pos: usize = text.len;
+            var best_match_len: usize = 0;
+            var best_match_id: u32 = 0;
+
+            var sit = self.special_tokens.iterator();
+            while (sit.next()) |entry| {
+                if (std.mem.indexOfPos(u8, text, pos, entry.key_ptr.*)) |found_pos| {
+                    if (found_pos < best_match_pos or (found_pos == best_match_pos and entry.key_ptr.len > best_match_len)) {
+                        best_match_pos = found_pos;
+                        best_match_len = entry.key_ptr.len;
+                        best_match_id = entry.value_ptr.*;
+                    }
+                }
+            }
+
+            if (best_match_len > 0) {
+                // Encode text before the special token
+                if (best_match_pos > pos) {
+                    const segment = text[pos..best_match_pos];
+                    const ids = try self.encodeSegment(allocator, segment);
+                    defer allocator.free(ids);
+                    try result.appendSlice(allocator, ids);
+                }
+                // Insert the special token ID
+                try result.append(allocator, best_match_id);
+                pos = best_match_pos + best_match_len;
+            } else {
+                // No more special tokens, encode the rest
+                if (pos < text.len) {
+                    const ids = try self.encodeSegment(allocator, text[pos..]);
+                    defer allocator.free(ids);
+                    try result.appendSlice(allocator, ids);
+                }
+                break;
+            }
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Encode a text segment (no special tokens) using the appropriate BPE method.
+    fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
         return switch (self.tok_type) {
             .sentencepiece_bpe => self.encodeSentencePiece(allocator, text),
             .byte_level_bpe => self.encodeByteLevel(allocator, text),
@@ -541,16 +591,15 @@ pub fn loadTokenizer(allocator: std.mem.Allocator, model_dir: []const u8) !Token
             const obj = token_val.object;
             const content_str = obj.get("content").?.string;
             const id: u32 = @intCast(obj.get("id").?.integer);
-            const special = if (obj.get("special")) |s| s.bool else false;
-            if (special) {
-                const key = try allocator.dupe(u8, content_str);
-                try special_tokens.put(key, id);
-                // Also add to vocab/id_to_token so they can be decoded
-                if (!vocab.contains(key)) {
-                    const key2 = try allocator.dupe(u8, content_str);
-                    try vocab.put(key2, id);
-                    try id_to_token.put(id, key2);
-                }
+            // Include ALL added tokens (both special=true and special=false like <think>, <tool_call>)
+            // so they are tokenized as single atomic units
+            const key = try allocator.dupe(u8, content_str);
+            try special_tokens.put(key, id);
+            // Also add to vocab/id_to_token so they can be decoded
+            if (!vocab.contains(key)) {
+                const key2 = try allocator.dupe(u8, content_str);
+                try vocab.put(key2, id);
+                try id_to_token.put(id, key2);
             }
         }
     }
@@ -566,7 +615,7 @@ pub fn loadTokenizer(allocator: std.mem.Allocator, model_dir: []const u8) !Token
         try unicode_to_byte.put(byte_to_unicode[b], @intCast(b));
     }
 
-    std.debug.print("Tokenizer loaded: {d} vocab, {d} merges, {d} special tokens ({s})\n", .{
+    log.info("Tokenizer loaded: {d} vocab, {d} merges, {d} special tokens ({s})\n", .{
         vocab.count(),
         merge_ranks.count(),
         special_tokens.count(),

@@ -3,6 +3,7 @@
 // potential issues with C++ headers and keep the dependency surface explicit.
 
 const std = @import("std");
+const log = @import("log.zig");
 
 // ── Opaque handle types ──
 pub const mlx_array = extern struct { ctx: ?*anyopaque = null };
@@ -13,6 +14,7 @@ pub const mlx_map_string_to_array = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_map_string_to_string = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_map_string_to_array_iterator = extern struct { ctx: ?*anyopaque = null, map_ctx: ?*anyopaque = null };
 pub const mlx_vector_array = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_closure = extern struct { ctx: ?*anyopaque = null };
 
 // ── Enums ──
 pub const mlx_dtype = enum(c_int) {
@@ -118,6 +120,17 @@ pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
 pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
 pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
 
+// Closure + compile
+pub extern "c" fn mlx_closure_new_func_payload(
+    fun: *const fn (*mlx_vector_array, mlx_vector_array, ?*anyopaque) callconv(.c) c_int,
+    payload: ?*anyopaque,
+    dtor: ?*const fn (?*anyopaque) callconv(.c) void,
+) mlx_closure;
+pub extern "c" fn mlx_closure_free(cls: mlx_closure) c_int;
+pub extern "c" fn mlx_closure_apply(res: *mlx_vector_array, cls: mlx_closure, input: mlx_vector_array) c_int;
+pub extern "c" fn mlx_compile(res: *mlx_closure, fun: mlx_closure, shapeless: bool) c_int;
+pub extern "c" fn mlx_detail_compile_clear_cache() c_int;
+
 // Map string -> array
 pub extern "c" fn mlx_map_string_to_array_new() mlx_map_string_to_array;
 pub extern "c" fn mlx_map_string_to_array_free(map: mlx_map_string_to_array) c_int;
@@ -166,7 +179,14 @@ pub extern "c" fn mlx_concatenate_axis(res: *mlx_array, arrays: mlx_vector_array
 pub extern "c" fn mlx_softmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, precise: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_argmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 
+pub extern "c" fn mlx_copy(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argsort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_topk(res: *mlx_array, a: mlx_array, k: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_cumsum(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+
 pub extern "c" fn mlx_mean_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
 
@@ -235,7 +255,7 @@ pub fn printArray(label: []const u8, arr: mlx_array) void {
     var str = mlx_string_new();
     _ = mlx_array_tostring(&str, arr);
     const data = mlx_string_data(str);
-    std.debug.print("{s}: {s}\n", .{ label, data });
+    log.debug("{s}: {s}\n", .{ label, data });
     _ = mlx_string_free(str);
 }
 
