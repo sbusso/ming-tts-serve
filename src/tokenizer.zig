@@ -459,14 +459,36 @@ pub const Tokenizer = struct {
     }
 };
 
-/// GPT-2 pre-tokenization: splits text using the GPT-2 regex pattern as a state machine.
-/// Pattern: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// GPT-2 pre-tokenization: splits text following the Qwen / Llama-3 / GPT-2
+/// pre-tokenizer regex as a hand-rolled state machine. Each iteration picks
+/// the FIRST matching pattern from the alternation, in declared order.
+///
+/// Reference (from `tokenizer.json` `pre_tokenizer.pretokenizers[0].pattern`):
+///
+///     (?i:'s|'t|'re|'ve|'m|'ll|'d)
+///   | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+///   | \p{N}
+///   |  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+///   | \s*[\r\n]+
+///   | \s+(?!\S)
+///   | \s+
+///
+/// Critical priority rules vs. naïve "consume whitespace, then letters":
+///   1. ` letter+` is one pre-token (pattern 2 with optional leading non-LN char).
+///   2. ` punct+` is one pre-token (pattern 4 with optional leading space).
+///   3. Multi-space `    word`: pattern 6 `\s+(?!\S)` matches all-but-last
+///      whitespace (`   `), then pattern 2 picks up the last space + letters
+///      as one combined ` word` pre-token. Getting this wrong adds extra
+///      whitespace pre-tokens that the BPE stage cannot merge across, and
+///      causes the model to see a perturbed prior on every subsequent word.
+///   4. Digits are SINGLE-codepoint pre-tokens (pattern 3 = `\p{N}`, not
+///      `\p{N}+`). `100` → three separate `1`, `0`, `0` pre-tokens.
 fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
     while (i < text.len) {
         const start = i;
 
-        // Try contraction: 's, 't, 're, 've, 'm, 'll, 'd (case insensitive)
+        // ── Pattern 1: contraction `(?i:'s|'t|'re|'ve|'m|'ll|'d)` ──
         if (text[i] == '\'' and i + 1 < text.len) {
             const next = std.ascii.toLower(text[i + 1]);
             if (next == 's' or next == 't' or next == 'm' or next == 'd') {
@@ -487,111 +509,180 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.A
             }
         }
 
-        // Letter sequence (possibly starting with one non-letter non-digit non-newline char)
-        const cp_start = decodeCodepoint(text, i);
-        if (cp_start) |cp_info| {
-            if (isLetter(cp_info.cp)) {
-                // Pure letter sequence
+        // ── Pattern 2: `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` ──
+        // Optional 1 char that's NOT \r, NOT \n, NOT letter, NOT digit (so it
+        // CAN be whitespace or punct), followed by 1+ letters/marks.
+        if (matchOptionalNonLnnAndLetters(text, i)) |new_i| {
+            i = new_i;
+            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+            continue;
+        }
+
+        // ── Pattern 3: `\p{N}` — exactly ONE digit codepoint ──
+        if (decodeCodepoint(text, i)) |cp_info| {
+            if (isDigit(cp_info.cp)) {
                 i += cp_info.len;
-                while (i < text.len) {
-                    const next_cp = decodeCodepoint(text, i) orelse break;
-                    if (!isLetter(next_cp.cp)) break;
-                    i += next_cp.len;
-                }
                 try words.append(allocator, try allocator.dupe(u8, text[start..i]));
                 continue;
             }
-
-            // Non-letter, non-digit, non-newline followed by letters?
-            if (!isDigit(cp_info.cp) and cp_info.cp != '\r' and cp_info.cp != '\n') {
-                const after_first = i + cp_info.len;
-                if (after_first < text.len) {
-                    const next_cp = decodeCodepoint(text, after_first);
-                    if (next_cp != null and isLetter(next_cp.?.cp)) {
-                        i = after_first + next_cp.?.len;
-                        while (i < text.len) {
-                            const lcp = decodeCodepoint(text, i) orelse break;
-                            if (!isLetter(lcp.cp)) break;
-                            i += lcp.len;
-                        }
-                        try words.append(allocator, try allocator.dupe(u8, text[start..i]));
-                        continue;
-                    }
-                }
-            }
         }
 
-        // Digit sequence
-        if (cp_start != null and isDigit(cp_start.?.cp)) {
-            i += cp_start.?.len;
-            while (i < text.len) {
-                const dcp = decodeCodepoint(text, i) orelse break;
-                if (!isDigit(dcp.cp)) break;
-                i += dcp.len;
-            }
+        // ── Pattern 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` ──
+        // Optional 1 space + 1+ chars that are NOT whitespace, NOT letter,
+        // NOT mark, NOT digit (i.e. punctuation/symbols), then optional \r\n.
+        if (matchOptionalSpaceAndPunct(text, i)) |new_i| {
+            i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
 
-        // Newline sequences: \s*[\r\n]+
-        if (text[i] == '\r' or text[i] == '\n') {
-            while (i < text.len and (text[i] == '\r' or text[i] == '\n')) {
-                i += 1;
-            }
+        // ── Pattern 5: `\s*[\r\n]+` — whitespace ending in newline run ──
+        if (matchWhitespaceWithNewline(text, i)) |new_i| {
+            i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
 
-        // Whitespace: consume spaces, handle [\r\n]* or trailing non-space
-        if (isWhitespace(text[i])) {
-            // Consume whitespace
-            while (i < text.len and isWhitespace(text[i]) and text[i] != '\r' and text[i] != '\n') {
-                i += 1;
-            }
-            // Check if all remaining is whitespace (the (?!\S) lookahead)
-            if (i >= text.len) {
-                // Trailing whitespace
-                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
-                continue;
-            }
-            if (text[i] == '\r' or text[i] == '\n') {
-                // Whitespace before newline
-                while (i < text.len and (text[i] == '\r' or text[i] == '\n')) {
-                    i += 1;
-                }
-                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
-                continue;
-            }
-            // Space before non-space: emit the space as part of the next token
-            // (GPT-2 pattern: " ?[^\s\p{L}\p{N}]+..." or just \s+)
-            // The space joins with the next word
+        // ── Pattern 6: `\s+(?!\S)` — whitespace not followed by non-ws ──
+        // Greedy match with backtrack: shortens by 1 if the next char is \S
+        // so the trailing space gets handed to pattern 2/4 on the next pass.
+        if (matchTrailingWhitespace(text, i)) |new_i| {
+            i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
 
-        // [^\s\p{L}\p{N}]+ sequence (punctuation/symbols): optional leading space
-        if (cp_start != null and !isLetter(cp_start.?.cp) and !isDigit(cp_start.?.cp) and !isWhitespace(text[i])) {
-            i += cp_start.?.len;
-            while (i < text.len) {
-                if (isWhitespace(text[i])) break;
-                const pcp = decodeCodepoint(text, i) orelse break;
-                if (isLetter(pcp.cp) or isDigit(pcp.cp)) break;
-                // Stop at contractions
-                if (text[i] == '\'') break;
-                i += pcp.len;
-            }
-            // Consume trailing \r\n
-            while (i < text.len and (text[i] == '\r' or text[i] == '\n')) {
-                i += 1;
-            }
+        // ── Pattern 7: `\s+` — fallback whitespace ──
+        if (i < text.len and isWhitespace(text[i])) {
+            while (i < text.len and isWhitespace(text[i])) i += 1;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
 
-        // Fallback: single byte
+        // Fallback: single byte (unreachable in well-formed UTF-8 input).
         i += 1;
         try words.append(allocator, try allocator.dupe(u8, text[start..i]));
     }
+}
+
+/// Pattern 2: `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`. Returns end position of
+/// match, or null if no letters at the right place.
+fn matchOptionalNonLnnAndLetters(text: []const u8, start: usize) ?usize {
+    if (start >= text.len) return null;
+    const cp_start = decodeCodepoint(text, start) orelse return null;
+
+    // Try with the optional non-LNN char consumed.
+    if (!isLetter(cp_start.cp) and !isDigit(cp_start.cp) and
+        cp_start.cp != '\r' and cp_start.cp != '\n')
+    {
+        const after_opt = start + cp_start.len;
+        if (after_opt < text.len) {
+            const next_cp = decodeCodepoint(text, after_opt);
+            if (next_cp != null and isLetterOrMark(next_cp.?.cp)) {
+                var i: usize = after_opt + next_cp.?.len;
+                while (i < text.len) {
+                    const c = decodeCodepoint(text, i) orelse break;
+                    if (!isLetterOrMark(c.cp)) break;
+                    i += c.len;
+                }
+                return i;
+            }
+        }
+    }
+
+    // Try with 0-length optional: text[start] must itself be a letter/mark.
+    if (isLetterOrMark(cp_start.cp)) {
+        var i: usize = start + cp_start.len;
+        while (i < text.len) {
+            const c = decodeCodepoint(text, i) orelse break;
+            if (!isLetterOrMark(c.cp)) break;
+            i += c.len;
+        }
+        return i;
+    }
+
+    return null;
+}
+
+/// Pattern 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`. Optional ASCII space then
+/// 1+ punct/symbol codepoints, then optional \r\n run. Returns end position
+/// or null. The optional space MUST be exactly the byte ' ' (0x20), not
+/// any other whitespace — matches Qwen's tokenizer.json regex literal.
+fn matchOptionalSpaceAndPunct(text: []const u8, start: usize) ?usize {
+    if (start >= text.len) return null;
+    var p_start: usize = start;
+    if (text[start] == ' ') p_start = start + 1;
+
+    if (p_start >= text.len) return null;
+    const first_cp = decodeCodepoint(text, p_start) orelse return null;
+    // Must be NOT whitespace, NOT letter, NOT mark, NOT digit.
+    if (isWhitespaceCp(first_cp.cp) or isLetter(first_cp.cp) or
+        isMark(first_cp.cp) or isDigit(first_cp.cp)) return null;
+
+    var i: usize = p_start + first_cp.len;
+    while (i < text.len) {
+        const c = decodeCodepoint(text, i) orelse break;
+        if (isWhitespaceCp(c.cp) or isLetter(c.cp) or isMark(c.cp) or isDigit(c.cp)) break;
+        i += c.len;
+    }
+    // Optional trailing \r\n.
+    while (i < text.len and (text[i] == '\r' or text[i] == '\n')) i += 1;
+    return i;
+}
+
+/// Pattern 5: `\s*[\r\n]+`. Returns end position, or null if no \r\n found
+/// after consuming \s*.
+fn matchWhitespaceWithNewline(text: []const u8, start: usize) ?usize {
+    var i: usize = start;
+    while (i < text.len and isWhitespace(text[i]) and text[i] != '\r' and text[i] != '\n') i += 1;
+    if (i >= text.len or (text[i] != '\r' and text[i] != '\n')) return null;
+    while (i < text.len and (text[i] == '\r' or text[i] == '\n')) i += 1;
+    return i;
+}
+
+/// Pattern 6: `\s+(?!\S)`. Greedy match of all whitespace bytes, then
+/// shortens by 1 if the next char is \S so the trailing space can be picked
+/// up by pattern 2/4 on the next iteration. Returns null if there's only
+/// one whitespace char and the next is \S (lookahead can't be satisfied).
+fn matchTrailingWhitespace(text: []const u8, start: usize) ?usize {
+    if (start >= text.len) return null;
+    if (!isWhitespace(text[start])) return null;
+    var end: usize = start;
+    while (end < text.len and isWhitespace(text[end])) end += 1;
+    // text[start..end] is the maximal whitespace run starting at start.
+    if (end == text.len) return end; // end of input — lookahead trivially OK
+    // text[end] is non-whitespace (\S). Backtrack one whitespace char so
+    // the position-after-match lands on a whitespace char (lookahead OK).
+    if (end - start >= 2) return end - 1;
+    return null;
+}
+
+fn isWhitespaceCp(cp: u21) bool {
+    if (cp > 0xFF) return false;
+    return isWhitespace(@intCast(cp));
+}
+
+fn isLetterOrMark(cp: u21) bool {
+    return isLetter(cp) or isMark(cp);
+}
+
+/// Approximate `\p{M}` — combining marks. Coverage: common Latin/Greek/
+/// Cyrillic combining marks (U+0300–U+036F), plus Hebrew/Arabic/Devanagari
+/// combining ranges. Not exhaustive, but handles every codepoint our test
+/// corpus encounters; expand if a non-ASCII model surfaces a false negative.
+fn isMark(cp: u21) bool {
+    if (cp >= 0x0300 and cp <= 0x036F) return true; // Combining diacritical marks
+    if (cp >= 0x0483 and cp <= 0x0489) return true; // Cyrillic combining
+    if (cp >= 0x0591 and cp <= 0x05BD) return true; // Hebrew points
+    if (cp >= 0x064B and cp <= 0x065F) return true; // Arabic harakat
+    if (cp >= 0x0670 and cp <= 0x0670) return true;
+    if (cp >= 0x06D6 and cp <= 0x06DC) return true;
+    if (cp >= 0x0900 and cp <= 0x097F) return true; // Devanagari (overlap with letters; harmless)
+    if (cp >= 0x1AB0 and cp <= 0x1AFF) return true;
+    if (cp >= 0x1DC0 and cp <= 0x1DFF) return true;
+    if (cp >= 0x20D0 and cp <= 0x20FF) return true;
+    if (cp >= 0xFE20 and cp <= 0xFE2F) return true;
+    return false;
 }
 
 const CpInfo = struct { cp: u21, len: usize };
@@ -1079,4 +1170,104 @@ test "WordPiece encode lowercases input" {
 
     try testing.expectEqual(@as(usize, 1), ids.len);
     try testing.expectEqual(@as(u32, 10), ids[0]);
+}
+
+// Helper for pre-tokenizer tests: run gpt2PreTokenize and compare the
+// emitted word strings to an expected slice. Owns the dupe'd word memory.
+fn expectPreTokens(allocator: std.mem.Allocator, input: []const u8, expected: []const []const u8) !void {
+    var words: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (words.items) |w| allocator.free(w);
+        words.deinit(allocator);
+    }
+    try gpt2PreTokenize(allocator, input, &words);
+    if (words.items.len != expected.len) {
+        std.debug.print("\n  pre-tokenize on {s}: got {d} words, expected {d}\n", .{
+            input, words.items.len, expected.len,
+        });
+        for (words.items, 0..) |w, i| std.debug.print("    [{d}] {s}\n", .{ i, w });
+        return error.WordCountMismatch;
+    }
+    for (words.items, expected, 0..) |got, want, idx| {
+        if (!std.mem.eql(u8, got, want)) {
+            std.debug.print("\n  pre-tokenize {s}: word[{d}] got `{s}` want `{s}`\n", .{
+                input, idx, got, want,
+            });
+            return error.WordContentMismatch;
+        }
+    }
+}
+
+test "gpt2PreTokenize: multi-space + identifier" {
+    // Regression: HF tokenizes `    total = 0` as
+    //   ['   ', ' total', ' =', ' ', '0']
+    // — the trailing space of the leading run joins with the next word, and
+    // single-digit pre-tokens are emitted one at a time. The previous impl
+    // emitted 4-space, identifier, single-space, =, single-space, 0 — six
+    // words instead of five, with the model receiving a perturbed prior on
+    // every subsequent word. Found via byte-diff against MTPLX.
+    try expectPreTokens(testing.allocator, "    total = 0", &.{
+        "   ", " total", " =", " ", "0",
+    });
+}
+
+test "gpt2PreTokenize: leading space combines with letters" {
+    // Pattern 2 absorbs the optional leading non-LN char.
+    try expectPreTokens(testing.allocator, " total", &.{" total"});
+    try expectPreTokens(testing.allocator, "def total", &.{ "def", " total" });
+}
+
+test "gpt2PreTokenize: leading space combines with punctuation" {
+    // Pattern 4 is ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*`.
+    try expectPreTokens(testing.allocator, " =", &.{" ="});
+    try expectPreTokens(testing.allocator, " += foo", &.{ " +=", " foo" });
+    // Multi-punct with leading space.
+    try expectPreTokens(testing.allocator, " *=", &.{" *="});
+}
+
+test "gpt2PreTokenize: digits are single-codepoint pre-tokens" {
+    // Pattern 3 is `\p{N}` (no `+`), so each digit is its own pre-token.
+    // BPE will not merge across pre-tokens, so this drives final token IDs.
+    try expectPreTokens(testing.allocator, "100", &.{ "1", "0", "0" });
+    try expectPreTokens(testing.allocator, " 100", &.{ " ", "1", "0", "0" });
+}
+
+test "gpt2PreTokenize: newline run after whitespace" {
+    // Pattern 5 `\s*[\r\n]+` consumes leading spaces along with the newline.
+    try expectPreTokens(testing.allocator, "x\n", &.{ "x", "\n" });
+    try expectPreTokens(testing.allocator, "x   \n", &.{ "x", "   \n" });
+    try expectPreTokens(testing.allocator, "x\n\n", &.{ "x", "\n\n" });
+}
+
+test "gpt2PreTokenize: trailing whitespace at end of input" {
+    // Pattern 6 trivially matches when end-of-input satisfies the lookahead.
+    try expectPreTokens(testing.allocator, "x   ", &.{ "x", "   " });
+}
+
+test "gpt2PreTokenize: full Python snippet matches HF reference" {
+    // Reference output produced by the HuggingFace `tokenizers` library on a
+    // Qwen3.5 tokenizer.json (any Qwen3.5/3.6 checkpoint reproduces this):
+    //   ['def', ' total', '(items', '):\n', '   ', ' total', ' =', ' ', '0']
+    // Note: `):\n` joins because pattern 4 allows trailing `[\r\n]*` after
+    // the punct run. The byte-level encode + BPE merge stage downstream
+    // turns this into exactly the same token-ids HF produces.
+    try expectPreTokens(testing.allocator,
+        "def total(items):\n    total = 0",
+        &.{ "def", " total", "(items", "):\n", "   ", " total", " =", " ", "0" },
+    );
+}
+
+test "gpt2PreTokenize: contractions still work after rewrite" {
+    try expectPreTokens(testing.allocator, "don't", &.{ "don", "'t" });
+    try expectPreTokens(testing.allocator, "they're", &.{ "they", "'re" });
+    try expectPreTokens(testing.allocator, "we'll", &.{ "we", "'ll" });
+}
+
+test "gpt2PreTokenize: punct + letter joins via pattern 2 optional non-LN" {
+    // `_start` matches pattern 2 with `_` as the optional non-LN char;
+    // pattern 4 would also match `_` alone, but pattern 2 wins by priority.
+    // HF reference: ['<|', 'im', '_start', '|>'].
+    try expectPreTokens(testing.allocator, "<|im_start|>", &.{
+        "<|", "im", "_start", "|>",
+    });
 }
