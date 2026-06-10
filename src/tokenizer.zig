@@ -393,53 +393,107 @@ pub const Tokenizer = struct {
 
     // ── Shared BPE merge logic ──
 
-    fn bpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]u32 {
-        // Split into individual UTF-8 characters
-        var symbols: std.ArrayList([]const u8) = .empty;
-        defer {
-            for (symbols.items) |s| allocator.free(s);
-            symbols.deinit(allocator);
+    /// One symbol in the BPE merge worklist. Symbols are always contiguous
+    /// slices `input[start..end]` — merging adjacent symbols just extends the
+    /// left node's range and unlinks the right, so no bytes are ever copied.
+    /// `ver` invalidates stale heap candidates: any merge touching a node
+    /// bumps its version, and a candidate is only applied when both stored
+    /// versions still match.
+    const BpeNode = struct {
+        start: u32,
+        end: u32,
+        prev: i32,
+        next: i32,
+        ver: u32,
+    };
+
+    /// Candidate pair in the merge heap, ordered by (rank, left node index).
+    /// Node indices are creation order = text order and merges never create
+    /// nodes, so the secondary key reproduces the naive scan's leftmost-wins
+    /// tie-break exactly.
+    const BpeCand = struct {
+        rank: u32,
+        left: u32,
+        right: u32,
+        lver: u32,
+        rver: u32,
+
+        fn order(_: void, a: BpeCand, b: BpeCand) std.math.Order {
+            if (a.rank != b.rank) return std.math.order(a.rank, b.rank);
+            return std.math.order(a.left, b.left);
         }
+    };
+
+    const BpeHeap = std.PriorityQueue(BpeCand, void, BpeCand.order);
+
+    fn bpePushCand(self: *const Tokenizer, allocator: std.mem.Allocator, heap: *BpeHeap, nodes: []const BpeNode, input: []const u8, l: u32, r: u32) !void {
+        const pair = MergePair{
+            .left = input[nodes[l].start..nodes[l].end],
+            .right = input[nodes[r].start..nodes[r].end],
+        };
+        if (self.merge_ranks.get(pair)) |rank| {
+            try heap.push(allocator, .{ .rank = rank, .left = l, .right = r, .lver = nodes[l].ver, .rver = nodes[r].ver });
+        }
+    }
+
+    /// Greedy BPE: repeatedly merge the lowest-ranked adjacent pair
+    /// (leftmost on ties) until no pair has a rank. Heap + linked-list,
+    /// O(n log n); `encodeSentencePiece` feeds entire prompts through here
+    /// with no pre-tokenization, so the previous rescan-all-pairs loop was
+    /// O(n²) and cost seconds on agent-sized (tens-of-KB) system prompts.
+    fn bpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]u32 {
+        // Split into individual UTF-8 characters.
+        var nodes: std.ArrayList(BpeNode) = .empty;
+        defer nodes.deinit(allocator);
 
         var idx: usize = 0;
         while (idx < input.len) {
             const char_len = std.unicode.utf8ByteSequenceLength(input[idx]) catch 1;
             const end = @min(idx + char_len, input.len);
-            const char_slice = try allocator.dupe(u8, input[idx..end]);
-            try symbols.append(allocator, char_slice);
+            const i: i32 = @intCast(nodes.items.len);
+            try nodes.append(allocator, .{
+                .start = @intCast(idx),
+                .end = @intCast(end),
+                .prev = i - 1,
+                .next = if (end < input.len) i + 1 else -1,
+                .ver = 0,
+            });
             idx = end;
         }
 
-        // Iteratively apply BPE merges (greedy: always pick lowest rank pair)
-        while (symbols.items.len > 1) {
-            var best_rank: u32 = std.math.maxInt(u32);
-            var best_idx: ?usize = null;
+        var heap: BpeHeap = .initContext({});
+        defer heap.deinit(allocator);
 
-            for (0..symbols.items.len - 1) |j| {
-                const pair = MergePair{ .left = symbols.items[j], .right = symbols.items[j + 1] };
-                if (self.merge_ranks.get(pair)) |rank| {
-                    if (rank < best_rank) {
-                        best_rank = rank;
-                        best_idx = j;
-                    }
-                }
+        if (nodes.items.len > 1) {
+            for (0..nodes.items.len - 1) |j| {
+                try self.bpePushCand(allocator, &heap, nodes.items, input, @intCast(j), @intCast(j + 1));
             }
-
-            if (best_idx == null) break;
-
-            const bi = best_idx.?;
-            const merged = try std.mem.concat(allocator, u8, &.{ symbols.items[bi], symbols.items[bi + 1] });
-            allocator.free(symbols.items[bi]);
-            allocator.free(symbols.items[bi + 1]);
-            symbols.items[bi] = merged;
-            _ = symbols.orderedRemove(bi + 1);
         }
 
-        // Map to vocab IDs
+        while (heap.pop()) |c| {
+            const ns = nodes.items;
+            if (ns[c.left].ver != c.lver or ns[c.right].ver != c.rver) continue;
+
+            // Merge right into left: extend range, unlink right, invalidate
+            // every candidate that referenced either node's old content.
+            ns[c.left].end = ns[c.right].end;
+            ns[c.left].ver += 1;
+            ns[c.right].ver += 1;
+            ns[c.left].next = ns[c.right].next;
+            if (ns[c.right].next >= 0) ns[@intCast(ns[c.right].next)].prev = @intCast(c.left);
+
+            if (ns[c.left].prev >= 0) try self.bpePushCand(allocator, &heap, ns, input, @intCast(ns[c.left].prev), c.left);
+            if (ns[c.left].next >= 0) try self.bpePushCand(allocator, &heap, ns, input, c.left, @intCast(ns[c.left].next));
+        }
+
+        // Map surviving symbols to vocab IDs.
         var ids: std.ArrayList(u32) = .empty;
         errdefer ids.deinit(allocator);
 
-        for (symbols.items) |sym| {
+        var cur: i32 = if (nodes.items.len > 0) 0 else -1;
+        while (cur >= 0) : (cur = nodes.items[@intCast(cur)].next) {
+            const n = nodes.items[@intCast(cur)];
+            const sym = input[n.start..n.end];
             if (self.vocab.get(sym)) |id| {
                 try ids.append(allocator, id);
             } else {
@@ -1270,4 +1324,147 @@ test "gpt2PreTokenize: punct + letter joins via pattern 2 optional non-LN" {
     try expectPreTokens(testing.allocator, "<|im_start|>", &.{
         "<|", "im", "_start", "|>",
     });
+}
+
+// ── BPE merge characterization tests ──
+// Pin the exact greedy semantics of `bpeMerge` (lowest rank first across the
+// whole sequence; leftmost wins rank ties; unknown symbols fall back to
+// byte-level pieces) so the merge algorithm can be swapped for a faster one
+// without changing a single output id.
+
+fn makeBpeTestTokenizer(
+    allocator: std.mem.Allocator,
+    vocab: *std.StringHashMap(u32),
+    merge_ranks: *std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage),
+    id_to_token: *std.AutoHashMap(u32, []const u8),
+    special_tokens: *std.StringHashMap(u32),
+) Tokenizer {
+    return Tokenizer{
+        .vocab = vocab.*,
+        .id_to_token = id_to_token.*,
+        .merge_ranks = merge_ranks.*,
+        .allocator = allocator,
+        .special_tokens = special_tokens.*,
+        .tok_type = .sentencepiece_bpe,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+    };
+}
+
+test "bpeMerge: lowest rank merges first regardless of position" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("a", 1);
+    try vocab.put("b", 2);
+    try vocab.put("c", 3);
+    try vocab.put("d", 4);
+    try vocab.put("ab", 5);
+    try vocab.put("cd", 6);
+    try vocab.put("abcd", 7);
+
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "c", .right = "d" }, 0);
+    try merge_ranks.put(.{ .left = "a", .right = "b" }, 1);
+    try merge_ranks.put(.{ .left = "ab", .right = "cd" }, 2);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.bpeMerge(allocator, "abcd");
+    defer allocator.free(ids);
+    try testing.expectEqualSlices(u32, &[_]u32{7}, ids);
+}
+
+test "bpeMerge: leftmost pair wins rank ties" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("a", 1);
+    try vocab.put("aa", 2);
+
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "a", .right = "a" }, 0);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    // "aaa": leftmost (a,a) merges first -> [aa, a]; (aa,a) has no rank.
+    const ids = try tok.bpeMerge(allocator, "aaa");
+    defer allocator.free(ids);
+    try testing.expectEqualSlices(u32, &[_]u32{ 2, 1 }, ids);
+}
+
+test "bpeMerge: cascading merges across merge sites" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("h", 1);
+    try vocab.put("e", 2);
+    try vocab.put("l", 3);
+    try vocab.put("o", 4);
+    try vocab.put("he", 5);
+    try vocab.put("ll", 6);
+    try vocab.put("hell", 7);
+    try vocab.put("hello", 8);
+
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "h", .right = "e" }, 0);
+    try merge_ranks.put(.{ .left = "l", .right = "l" }, 1);
+    try merge_ranks.put(.{ .left = "he", .right = "ll" }, 2);
+    try merge_ranks.put(.{ .left = "hell", .right = "o" }, 3);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.bpeMerge(allocator, "hellohello");
+    defer allocator.free(ids);
+    try testing.expectEqualSlices(u32, &[_]u32{ 8, 8 }, ids);
+}
+
+test "bpeMerge: symbols missing from vocab fall back to byte pieces" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("a", 1);
+    // 'z' itself is NOT in vocab; its byte-to-unicode form is.
+    const z_cp = buildBytesToUnicode()['z'];
+    var z_buf: [4]u8 = undefined;
+    const z_len = try std.unicode.utf8Encode(z_cp, &z_buf);
+    try vocab.put(z_buf[0..z_len], 99);
+
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.bpeMerge(allocator, "az");
+    defer allocator.free(ids);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 99 }, ids);
 }
