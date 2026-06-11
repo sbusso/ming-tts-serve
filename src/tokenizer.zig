@@ -1259,7 +1259,7 @@ test "gpt2PreTokenize: multi-space + identifier" {
     // single-digit pre-tokens are emitted one at a time. The previous impl
     // emitted 4-space, identifier, single-space, =, single-space, 0 — six
     // words instead of five, with the model receiving a perturbed prior on
-    // every subsequent word. Found via byte-diff against MTPLX.
+    // every subsequent word. Found via byte-diff against a reference tokenizer.
     try expectPreTokens(testing.allocator, "    total = 0", &.{
         "   ", " total", " =", " ", "0",
     });
