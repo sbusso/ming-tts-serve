@@ -102,44 +102,76 @@ pub const Tokenizer = struct {
             return result.toOwnedSlice(allocator);
         }
 
-        var pos: usize = 0;
-        while (pos < text.len) {
-            // Find the earliest special token at or after pos
-            var best_match_pos: usize = text.len;
-            var best_match_len: usize = 0;
-            var best_match_id: u32 = 0;
-
+        // Special-token splitter. The old scan re-searched the ENTIRE
+        // remaining text for EVERY special token per segment
+        // (O(specials × text) — ~12 s per 66 KB prompt on gemma-3's
+        // 6415-special vocabulary; gemma-4's 24 specials never noticed).
+        // Instead: bucket the specials by first byte once per call (~µs),
+        // then a single left-to-right pass tries only the candidates whose
+        // first byte matches. Semantics unchanged — earliest occurrence
+        // wins, longest special wins at the same position (buckets are
+        // sorted by descending length, so the first hit is the longest).
+        const n_special = self.special_tokens.count();
+        const Cand = struct { bytes: []const u8, id: u32 };
+        const cands = try allocator.alloc(Cand, n_special);
+        defer allocator.free(cands);
+        {
+            var i: usize = 0;
             var sit = self.special_tokens.iterator();
-            while (sit.next()) |entry| {
-                if (std.mem.indexOfPos(u8, text, pos, entry.key_ptr.*)) |found_pos| {
-                    if (found_pos < best_match_pos or (found_pos == best_match_pos and entry.key_ptr.len > best_match_len)) {
-                        best_match_pos = found_pos;
-                        best_match_len = entry.key_ptr.len;
-                        best_match_id = entry.value_ptr.*;
-                    }
-                }
+            while (sit.next()) |entry| : (i += 1) {
+                cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
             }
+        }
+        std.mem.sort(Cand, cands, {}, struct {
+            fn lessThan(_: void, a: Cand, b: Cand) bool {
+                const ab: u8 = if (a.bytes.len > 0) a.bytes[0] else 0;
+                const bb: u8 = if (b.bytes.len > 0) b.bytes[0] else 0;
+                if (ab != bb) return ab < bb;
+                return a.bytes.len > b.bytes.len;
+            }
+        }.lessThan);
+        // bucket_start[b]..bucket_start[b+1] = candidates whose first byte is b.
+        var bucket_start = [_]u32{0} ** 257;
+        {
+            var ci: usize = 0;
+            for (0..256) |b| {
+                bucket_start[b] = @intCast(ci);
+                while (ci < cands.len and cands[ci].bytes.len > 0 and cands[ci].bytes[0] == b) ci += 1;
+            }
+            bucket_start[256] = @intCast(cands.len);
+        }
 
-            if (best_match_len > 0) {
-                // Encode text before the special token
-                if (best_match_pos > pos) {
-                    const segment = text[pos..best_match_pos];
-                    const ids = try self.encodeSegment(allocator, segment);
-                    defer allocator.free(ids);
-                    try result.appendSlice(allocator, ids);
+        var pos: usize = 0;
+        var seg_start: usize = 0;
+        while (pos < text.len) {
+            const b = text[pos];
+            var ci = bucket_start[b];
+            const cend = bucket_start[@as(usize, b) + 1];
+            var matched: ?Cand = null;
+            while (ci < cend) : (ci += 1) {
+                const c = cands[ci];
+                if (c.bytes.len <= text.len - pos and std.mem.startsWith(u8, text[pos..], c.bytes)) {
+                    matched = c;
+                    break;
                 }
-                // Insert the special token ID
-                try result.append(allocator, best_match_id);
-                pos = best_match_pos + best_match_len;
-            } else {
-                // No more special tokens, encode the rest
-                if (pos < text.len) {
-                    const ids = try self.encodeSegment(allocator, text[pos..]);
-                    defer allocator.free(ids);
-                    try result.appendSlice(allocator, ids);
-                }
-                break;
             }
+            if (matched) |m| {
+                if (pos > seg_start) {
+                    const ids = try self.encodeSegment(allocator, text[seg_start..pos]);
+                    defer allocator.free(ids);
+                    try result.appendSlice(allocator, ids);
+                }
+                try result.append(allocator, m.id);
+                pos += m.bytes.len;
+                seg_start = pos;
+            } else {
+                pos += 1;
+            }
+        }
+        if (seg_start < text.len) {
+            const ids = try self.encodeSegment(allocator, text[seg_start..]);
+            defer allocator.free(ids);
+            try result.appendSlice(allocator, ids);
         }
 
         return result.toOwnedSlice(allocator);
@@ -1058,6 +1090,81 @@ test "isPunct identifies punctuation" {
     try testing.expect(!Tokenizer.isPunct('a'));
     try testing.expect(!Tokenizer.isPunct('0'));
     try testing.expect(!Tokenizer.isPunct(' '));
+}
+
+test "encode special-token scan: earliest match, longest tie-break, adjacency" {
+    // Characterization for the special-token splitter in `encode` — pins the
+    // exact semantics (earliest occurrence wins; at the same position the
+    // LONGEST special wins; adjacent specials produce no empty segments) so
+    // the O(text) bucketed scan that replaced the per-special re-search
+    // (12 s per 66 KB prompt on gemma-3's 6415-special vocab) can't drift.
+    const allocator = testing.allocator;
+
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("a", 1);
+    try vocab.put("b", 2);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    try id_to_token.put(1, "a");
+    try id_to_token.put(2, "b");
+
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    try special_tokens.put("<tok>", 90);
+    try special_tokens.put("<tok>x", 91);
+    try special_tokens.put("<s>", 92);
+    try special_tokens.put("<u>", 93);
+
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var tok = Tokenizer{
+        .vocab = vocab,
+        .id_to_token = id_to_token,
+        .merge_ranks = merge_ranks,
+        .allocator = allocator,
+        .special_tokens = special_tokens,
+        .tok_type = .sentencepiece_bpe,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+    };
+    defer tok.unicode_to_byte.deinit();
+
+    // Longest tie-break: "<tok>x" and "<tok>" both match at position 1 —
+    // the longer one must win.
+    {
+        const ids = try tok.encode(allocator, "a<tok>xb");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 1, 91, 2 }, ids);
+    }
+    // Adjacent specials, special at start, trailing text.
+    {
+        const ids = try tok.encode(allocator, "<s><s>a");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 92, 92, 1 }, ids);
+    }
+    // Earliest occurrence wins regardless of hashmap iteration order.
+    {
+        const ids = try tok.encode(allocator, "b<u>a<s>");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 2, 93, 1, 92 }, ids);
+    }
+    // No specials present at all: whole text is one segment.
+    {
+        const ids = try tok.encode(allocator, "ab");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 1, 2 }, ids);
+    }
+    // Special token at the very end, nothing after it.
+    {
+        const ids = try tok.encode(allocator, "a<s>");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 1, 92 }, ids);
+    }
 }
 
 test "WordPiece encode basic" {
