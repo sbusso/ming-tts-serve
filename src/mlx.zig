@@ -148,6 +148,8 @@ pub extern "c" fn mlx_map_string_to_array_iterator_next(key: *?[*:0]const u8, va
 // Map string -> string
 pub extern "c" fn mlx_map_string_to_string_new() mlx_map_string_to_string;
 pub extern "c" fn mlx_map_string_to_string_free(map: mlx_map_string_to_string) c_int;
+pub extern "c" fn mlx_map_string_to_string_insert(map: mlx_map_string_to_string, key: [*:0]const u8, value: [*:0]const u8) c_int;
+pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) c_int;
 
 // IO
 pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
