@@ -334,6 +334,7 @@ pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
+pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
 pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
 pub extern "c" fn mlx_reset_peak_memory() c_int;
 
