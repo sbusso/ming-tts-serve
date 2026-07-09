@@ -17,6 +17,15 @@ pub fn nowMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 
+/// Milliseconds on the MONOTONIC `boot` clock (arbitrary epoch — only
+/// differences are meaningful). Use for deadlines/intervals, never for
+/// timestamps a client sees: an NTP step or a manual clock change must not be
+/// able to stall (or spam) a timer. `.boot` counts across pmset sleep, so a
+/// deadline that expired while the lid was shut fires immediately on wake.
+pub fn nowMsMonotonic(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .boot).toMilliseconds();
+}
+
 /// Drop-in replacement for `std.time.Timer` — uses the `boot` clock, which
 /// counts wall-time across pmset sleep (vs `.awake`, which stops during
 /// suspend). Important for long-running stopwatches that span a lid close.
