@@ -12,6 +12,7 @@
 //! write is swallowed (logging must never take the server down).
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Level = enum {
     err,
@@ -191,9 +192,20 @@ fn writeToSink(bytes: []const u8) void {
     sink_bytes += bytes.len;
 }
 
-/// Tests-only: the file-sink test drives `info`/`debug` for real, and without
-/// this it would spray dozens of lines into the test suite's stderr.
-var stderr_enabled: bool = true;
+/// Server builds log to stderr; TEST builds do not.
+///
+/// A unit test that exercises a logging code path (the tool-call parse layer
+/// alone emits hundreds of lines) sprays them into the suite's stderr, where
+/// they do two kinds of damage: they bury the one line that matters when a test
+/// actually fails, and Zig's build runner echoes any test stderr back tagged
+/// with a `failed command: …/test --listen=-` line — which READS AS A FAILURE
+/// even though the build exits 0 and every test passed. That false signal cost
+/// real debugging time on both sides of a genuine CI break (2026-07-14). Test
+/// failures themselves are unaffected: they surface through the test runner and
+/// through each test's own `std.debug.print`, neither of which goes through here.
+///
+/// Flip it locally (see the file-sink test) when a test must assert on logging.
+var stderr_enabled: bool = !builtin.is_test;
 
 /// Format once, fan out to stderr and (when open) the file.
 fn emit(comptime fmt: []const u8, args: anytype) void {
@@ -311,8 +323,9 @@ test "file sink: writes lines, honors level, survives reopen, rotates at the cap
     const original = current_level;
     defer setLevel(original);
     setLevel(.info);
-    stderr_enabled = false; // keep the suite's stderr clean
-    defer stderr_enabled = true;
+    const original_stderr = stderr_enabled;
+    stderr_enabled = false; // this test drives info/debug for real
+    defer stderr_enabled = original_stderr;
 
     // No sink yet -> nothing on disk, and filePath reports that.
     try testing.expect(filePath() == null);
