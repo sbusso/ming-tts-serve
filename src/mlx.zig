@@ -345,6 +345,7 @@ pub extern "c" fn mlx_device_info_new() mlx_device_info;
 pub extern "c" fn mlx_device_info_get(info: *mlx_device_info, dev: mlx_device) c_int;
 pub extern "c" fn mlx_device_info_free(info: mlx_device_info) c_int;
 pub extern "c" fn mlx_device_info_get_size(res: *usize, info: mlx_device_info, key: [*:0]const u8) c_int;
+pub extern "c" fn mlx_device_info_get_string(res: *[*:0]const u8, info: mlx_device_info, key: [*:0]const u8) c_int;
 
 // ── Error handler ──
 pub const mlx_error_handler_func = ?*const fn ([*:0]const u8, ?*anyopaque) callconv(.c) void;
