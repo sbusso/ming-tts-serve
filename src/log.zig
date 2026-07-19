@@ -383,7 +383,7 @@ test "file sink: writes lines, honors level, survives reopen, rotates at the cap
     // must never read as the model's actual output.
     _ = std.c.unlink(deep);
     try openFile(deep, 0);
-    const huge = "x" ** (line_buf_len + 500);
+    const huge: [line_buf_len + 500]u8 = @splat('x');
     info("{s}\n", .{huge});
     closeFile();
     var big: [line_buf_len * 2]u8 = undefined;

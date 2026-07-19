@@ -131,7 +131,7 @@ pub const Tokenizer = struct {
             }
         }.lessThan);
         // bucket_start[b]..bucket_start[b+1] = candidates whose first byte is b.
-        var bucket_start = [_]u32{0} ** 257;
+        var bucket_start: [257]u32 = @splat(0);
         {
             var ci: usize = 0;
             for (0..256) |b| {
