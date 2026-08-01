@@ -82,6 +82,18 @@ pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
 pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
 pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
 pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
+pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) c_int;
+
+/// True when the stream targets the GPU (custom Metal kernels require it).
+pub fn streamIsGpu(s: mlx_stream) bool {
+    var dev = mlx_device{ .ctx = null };
+    if (mlx_stream_get_device(&dev, s) != 0) return false;
+    defer _ = mlx_device_free(dev);
+    var dt: mlx_device_type = .cpu;
+    if (mlx_device_get_type(&dt, dev) != 0) return false;
+    return dt == .gpu;
+}
 pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
 
 // Metal
@@ -164,6 +176,20 @@ pub extern "c" fn mlx_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx
 pub extern "c" fn mlx_floor_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_negative(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+// Kokoro's SineGen takes the fractional part of a phase ramp (`x - floor(x)`).
+pub extern "c" fn mlx_floor(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_ceil(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log2(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_round(res: *mlx_array, a: mlx_array, decimals: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sign(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+// Complex plumbing for Kokoro's iSTFTNet head. mlx-c has NO "build a complex
+// array from two real ones" op, so the spectrum is assembled as `re + im·i`
+// using a complex SCALAR from `mlx_array_new_complex` (float ⊕ complex
+// promotes to complex).
+pub extern "c" fn mlx_real(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_imag(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_arctan2(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
 pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
@@ -200,6 +226,10 @@ pub extern "c" fn mlx_topk(res: *mlx_array, a: mlx_array, k: c_int, s: mlx_strea
 pub extern "c" fn mlx_cumsum(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_mean_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+// Variance along one axis — the InstanceNorm1d half of Kokoro's AdaIN1d
+// (`src/kokoro.zig`). `ddof` 0 = biased/population variance, which is what
+// torch's normalization layers use.
+pub extern "c" fn mlx_var_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
@@ -244,12 +274,18 @@ pub extern "c" fn mlx_quantize(res: *mlx_vector_array, w: mlx_array, group_size:
 // Additional ops for MoE / GatedDeltaNet
 pub extern "c" fn mlx_sigmoid(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sum_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_max_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sum(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) c_int;
 // FFT — real-input forward transform for the TTS speaker-encoder mel/STFT.
 // `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
 pub const mlx_fft_norm = c_int;
 pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
 pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+// Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
+// (`src/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states
+// the frame size (20) rather than inferring it from the 11-bin input.
+pub extern "c" fn mlx_fft_irfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
 // 2D/3D conv + transposed conv for the media-generation decoders (VAE/vocoder).
 // MLX layout: input NHWC / NDHWC, weight OHWI / ODHWI (out-channels first, in-channels last).
 pub extern "c" fn mlx_conv2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, groups: c_int, s: mlx_stream) c_int;
@@ -265,6 +301,7 @@ pub extern "c" fn mlx_put_along_axis(res: *mlx_array, a: mlx_array, indices: mlx
 pub extern "c" fn mlx_logical_and(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_logical_or(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_repeat_axis(res: *mlx_array, arr: mlx_array, repeats: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_tile(res: *mlx_array, arr: mlx_array, reps: [*]const c_int, reps_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_log1p(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_logaddexp(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_stack_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
@@ -309,6 +346,9 @@ pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: m
 // ── Random ──
 pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
+// Uniform noise — Kokoro's SineGen draws a random initial phase per harmonic.
+// Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
+pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
 // Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
 pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
@@ -394,7 +434,234 @@ pub fn getShape(arr: mlx_array) []const c_int {
     return mlx_array_shape(arr)[0..ndim];
 }
 
+/// How a residual's dtype moved between two observation points.
+pub const DtypeStep = enum { quiet, widened, narrowed, changed };
+
+/// Bytes per element, for deciding whether a dtype change WIDENED the stream.
+/// Only the dtypes a residual can actually hold are named; anything else is
+/// reported as a plain change rather than guessed at.
+pub fn dtypeBytes(d: mlx_dtype) ?u8 {
+    return switch (d) {
+        .float16, .bfloat16 => 2,
+        .float32 => 4,
+        .float64 => 8,
+        else => null,
+    };
+}
+
+pub fn dtypeStep(prev: mlx_dtype, cur: mlx_dtype) DtypeStep {
+    if (prev == cur) return .quiet;
+    const pb = dtypeBytes(prev) orelse return .changed;
+    const cb = dtypeBytes(cur) orelse return .changed;
+    if (cb > pb) return .widened;
+    if (cb < pb) return .narrowed;
+    return .changed; // same width, different kernel selection (bf16 vs f16)
+}
+
+/// One-shot latches for `[dtype-trace]`, keyed by forward-path name. A vision
+/// tower and its text trunk are different paths and latch independently.
+var dtype_trace_seen: [12]?[]const u8 = @splat(null);
+
+/// True the FIRST time `path` is seen, false forever after. After the first
+/// forward the trace costs nothing — a per-layer FFI dtype read on every token
+/// would be a real (if small) tax, and identical repeated lines would bury the
+/// one line that matters.
+pub fn dtypeTraceArm(path: []const u8) bool {
+    for (&dtype_trace_seen) |*slot| {
+        if (slot.*) |seen| {
+            if (std.mem.eql(u8, seen, path)) return false;
+            continue;
+        }
+        slot.* = path;
+        return true;
+    }
+    return false; // table full — stop tracing rather than spam
+}
+
+pub fn resetDtypeTraceForTest() void {
+    dtype_trace_seen = @splat(null);
+}
+
+/// DIAGNOSTIC (`[dtype-trace]`): watch the residual stream's dtype across one
+/// forward pass.
+///
+/// A residual wider than the weights promotes EVERY projection's weight on
+/// read, so the cost lands as a UNIFORM multiple across attention, MLP and
+/// lm_head — which reads like a platform problem, not a bug. The Laguna YaRN
+/// mscale table (f32 constant multiplied into bf16 q/k) cost 3x and was
+/// invisible to op count, kernel choice, KV ablation and the CPU/GPU split.
+/// Endpoints alone say THAT it widened; per-layer lines on every layer are
+/// unreadable. So: log both endpoints, and in between log only where the dtype
+/// actually moves — one line that names the layer responsible.
+pub const DtypeTrace = struct {
+    path: []const u8,
+    on: bool,
+    last: mlx_dtype,
+
+    pub fn begin(path: []const u8, h: mlx_array, weight: ?mlx_array) DtypeTrace {
+        const on = dtypeTraceArm(path);
+        const d = mlx_array_dtype(h);
+        if (on) {
+            log.info("[dtype-trace] {s}: residual in = {s}, first weight = {s}\n", .{
+                path,
+                @tagName(d),
+                if (weight) |w| (if (w.ctx == null) "null" else @tagName(mlx_array_dtype(w))) else "n/a",
+            });
+        }
+        return .{ .path = path, .on = on, .last = d };
+    }
+
+    pub fn layer(self: *DtypeTrace, h: mlx_array, layer_idx: usize) void {
+        if (!self.on) return;
+        const d = mlx_array_dtype(h);
+        const step = dtypeStep(self.last, d);
+        if (step == .quiet) return;
+        log.info("[dtype-trace] {s}: residual {s} at layer {d}: {s} -> {s}\n", .{
+            self.path,
+            @tagName(step),
+            layer_idx,
+            @tagName(self.last),
+            @tagName(d),
+        });
+        self.last = d;
+    }
+
+    pub fn end(self: *DtypeTrace, h: mlx_array) void {
+        if (!self.on) return;
+        log.info("[dtype-trace] {s}: residual out = {s}\n", .{ self.path, @tagName(mlx_array_dtype(h)) });
+    }
+};
+
 /// Check if an mlx-c call succeeded (returns 0 on success)
+/// DIAGNOSTIC op counter. Every graph-building op funnels through `check`, so
+/// this counts ops ISSUED (not kernels dispatched — MLX fuses some). Only read
+/// by the decode forward probe; the increment is a single relaxed add on a
+/// path that already does an FFI call, so it does not move any benchmark.
+pub var op_count: std.atomic.Value(u64) = .init(0);
+
 pub fn check(ret: c_int) !void {
+    _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
+}
+
+// ---------------------------------------------------------------------------
+// Wired-residency policy (mlxfast notes/47 class).
+//
+// MLX's Metal residency set has a capacity set by `mlx_set_wired_limit`. Two
+// failure shapes bracket the useful setting:
+//  * capacity 0 (MLX default): nothing is wired, and the driver re-establishes
+//    residency for the whole RAM-resident model on every command buffer —
+//    measured upstream as 9-15 ms kernelStart gaps across a prefill.
+//  * capacity >> live bytes (our historical `max_recommended_working_set_size`):
+//    every transient allocation fits the residency set, so each alloc/evict
+//    issues a Metal commit() — per-allocation overhead on the decode path.
+// The `fit` policy wires the CURRENT live set with a small slack and no
+// headroom: weights migrate into the set in one resize commit, and every later
+// transient FAILS the fit test and stays on the commit-free unwired path.
+// Re-applied after every load/unload so the capacity tracks the live set.
+
+pub const WiredMode = enum {
+    off, // wire nothing (MLX default behavior)
+    max, // capacity = max_recommended_working_set_size (historical behavior)
+    fit, // capacity = live bytes + slack (zero headroom)
+
+    pub fn fromEnv(value: ?[]const u8) WiredMode {
+        const v = value orelse return .max;
+        if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "0")) return .off;
+        if (std.mem.eql(u8, v, "max")) return .max;
+        if (std.mem.eql(u8, v, "fit")) return .fit;
+        return .max;
+    }
+};
+
+/// Zero-headroom capacity for `fit` mode. `set_wired_limit` above the
+/// recommended working set is an uncatchable MLX error, so the target is
+/// clamped a margin under it; a dead device query or an empty live set
+/// declines (null) rather than wiring garbage.
+pub fn wiredFitTarget(active_bytes: usize, slack_bytes: usize, max_rec: usize) ?usize {
+    if (active_bytes == 0 or max_rec == 0) return null;
+    const margin = 256 << 20;
+    if (max_rec <= margin) return null;
+    const cap = max_rec - margin;
+    const target = active_bytes +| slack_bytes;
+    return @min(target, cap);
+}
+
+pub const WiredPolicyResult = struct { mode: WiredMode, target: ?usize };
+
+pub fn maxRecommendedWorkingSet() usize {
+    var dev = mlx_device{ .ctx = null };
+    _ = mlx_get_default_device(&dev);
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    if (mlx_device_info_get(&info, dev) != 0) return 0;
+    var max_rec: usize = 0;
+    if (mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0) return 0;
+    return max_rec;
+}
+
+/// Apply the wired-residency policy. Call on the inference thread AFTER a
+/// model load or unload completes (and from the offline run path after load)
+/// so `fit` capacity tracks the live set. The caller logs the result.
+pub fn applyWiredPolicy() WiredPolicyResult {
+    const mode = WiredMode.fromEnv(if (std.c.getenv("MLX_SERVE_WIRED")) |p| std.mem.span(p) else null);
+    if (noGpuBackend()) return .{ .mode = mode, .target = null };
+    var prev: usize = 0;
+    switch (mode) {
+        .off => {
+            _ = mlx_set_wired_limit(&prev, 0);
+            return .{ .mode = mode, .target = 0 };
+        },
+        .max => {
+            const max_rec = maxRecommendedWorkingSet();
+            if (max_rec == 0) return .{ .mode = mode, .target = null };
+            _ = mlx_set_wired_limit(&prev, max_rec);
+            return .{ .mode = mode, .target = max_rec };
+        },
+        .fit => {
+            // Drop cached (free) buffers first so the resize walk wires only
+            // live weights and the capacity leaves no headroom for scratch.
+            _ = mlx_clear_cache();
+            const max_rec = maxRecommendedWorkingSet();
+            var active: usize = 0;
+            _ = mlx_get_active_memory(&active);
+            const slack_mb: usize = blk: {
+                const raw_c = std.c.getenv("MLX_SERVE_WIRED_SLACK_MB") orelse break :blk 64;
+                const raw = std.mem.span(raw_c);
+                break :blk std.fmt.parseInt(usize, raw, 10) catch 64;
+            };
+            const target = wiredFitTarget(active, slack_mb << 20, max_rec) orelse
+                return .{ .mode = mode, .target = null };
+            // Shrink-then-grow forces ResidencySet::resize to re-walk, pulling
+            // buffers allocated since the last apply out of the unwired set.
+            _ = mlx_set_wired_limit(&prev, 0);
+            _ = mlx_set_wired_limit(&prev, target);
+            return .{ .mode = mode, .target = target };
+        },
+    }
+}
+
+test "wired mode from env" {
+    const t = std.testing;
+    // Default (unset) is the historical behavior until the fit-policy A/B
+    // picks a winner; unknown values also take the default rather than
+    // silently wiring nothing.
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv(null));
+    try t.expectEqual(WiredMode.off, WiredMode.fromEnv("off"));
+    try t.expectEqual(WiredMode.off, WiredMode.fromEnv("0"));
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv("max"));
+    try t.expectEqual(WiredMode.fit, WiredMode.fromEnv("fit"));
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv("banana"));
+}
+
+test "wired fit target: zero headroom, clamped, declines empty" {
+    const t = std.testing;
+    const gb = 1 << 30;
+    // Normal: live + slack.
+    try t.expectEqual(@as(?usize, 10 * gb + (64 << 20)), wiredFitTarget(10 * gb, 64 << 20, 115 * gb));
+    // Live set near the ceiling clamps a margin under max_rec.
+    try t.expectEqual(@as(?usize, 115 * gb - (256 << 20)), wiredFitTarget(115 * gb, 64 << 20, 115 * gb));
+    // Nothing live / dead query: decline.
+    try t.expectEqual(@as(?usize, null), wiredFitTarget(0, 64 << 20, 115 * gb));
+    try t.expectEqual(@as(?usize, null), wiredFitTarget(10 * gb, 64 << 20, 0));
 }
