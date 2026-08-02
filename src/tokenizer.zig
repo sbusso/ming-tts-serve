@@ -17,6 +17,9 @@ pub const Tokenizer = struct {
     special_tokens: std.StringHashMap(u32),
     /// Tokenizer type determines encode/decode behavior
     tok_type: TokenizerType,
+    /// Digits per pre-token for the byte-level path: 1 (`\p{N}`, Qwen/GPT-2)
+    /// or 3 (`\p{N}{1,3}`, DeepSeek-V4/Llama-3) — parsed from tokenizer.json.
+    digit_group: u8 = 1,
     /// Byte-to-unicode mapping for byte-level BPE (256 entries, index = byte value)
     byte_to_unicode: [256]u21,
     /// Unicode-to-byte reverse mapping
@@ -263,7 +266,7 @@ pub const Tokenizer = struct {
             for (words.items) |w| allocator.free(w);
             words.deinit(allocator);
         }
-        try gpt2PreTokenize(allocator, text, &words);
+        try gpt2PreTokenize(allocator, text, self.digit_group, &words);
 
         // For each word: map bytes to unicode chars, then BPE merge, then look up vocab
         var all_ids = std.ArrayList(u32).empty;
@@ -569,7 +572,13 @@ pub const Tokenizer = struct {
 ///      causes the model to see a perturbed prior on every subsequent word.
 ///   4. Digits are SINGLE-codepoint pre-tokens (pattern 3 = `\p{N}`, not
 ///      `\p{N}+`). `100` → three separate `1`, `0`, `0` pre-tokens.
-fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.ArrayList([]const u8)) !void {
+/// `digit_group`: how many consecutive digits form one pre-token. 1 = the
+/// Qwen/GPT-2 `\p{N}` rule; 3 = the DeepSeek-V4/Llama-3 `\p{N}{1,3}` rule
+/// (greedy left-to-right groups). Parsed per model from tokenizer.json —
+/// feeding a {1,3}-trained model per-digit pre-tokens puts every number
+/// off-distribution (the echo-precision slip class: `1o` for `10`, split
+/// digits, o-for-0 near-ties).
+fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: u8, words: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
     while (i < text.len) {
         const start = i;
@@ -604,10 +613,16 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, words: *std.A
             continue;
         }
 
-        // ── Pattern 3: `\p{N}` — exactly ONE digit codepoint ──
+        // ── Pattern 3: `\p{N}` or `\p{N}{1,3}` — up to digit_group digits ──
         if (decodeCodepoint(text, i)) |cp_info| {
             if (isDigit(cp_info.cp)) {
                 i += cp_info.len;
+                var taken: u8 = 1;
+                while (taken < digit_group) : (taken += 1) {
+                    const next = decodeCodepoint(text, i) orelse break;
+                    if (!isDigit(next.cp)) break;
+                    i += next.len;
+                }
                 try words.append(allocator, try allocator.dupe(u8, text[start..i]));
                 continue;
             }
@@ -1030,12 +1045,42 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .allocator = allocator,
         .special_tokens = special_tokens,
         .tok_type = tok_type,
+        .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
         .eos_id = eos_id,
         .parsed_json = parsed,
     };
+}
+
+/// Digits per pre-token from the tokenizer.json `pre_tokenizer` spec: a
+/// `Split` rule (top-level or inside a `Sequence`) whose regex is exactly
+/// `\p{N}{1,3}` selects 3-digit grouping; anything else keeps the GPT-2
+/// single-digit rule. Deliberately exact-match — an unrecognized digit rule
+/// keeps the conservative behavior rather than guessing.
+fn digitGroupFromPreTokenizer(pt: std.json.Value) u8 {
+    if (pt != .object) return 1;
+    if (splitRegexIsDigits13(pt)) return 3;
+    if (pt.object.get("pretokenizers")) |list| {
+        if (list == .array) {
+            for (list.array.items) |sub| {
+                if (sub == .object and splitRegexIsDigits13(sub)) return 3;
+            }
+        }
+    }
+    return 1;
+}
+
+fn splitRegexIsDigits13(node: std.json.Value) bool {
+    const obj = node.object;
+    const ty = obj.get("type") orelse return false;
+    if (ty != .string or !std.mem.eql(u8, ty.string, "Split")) return false;
+    const pat = obj.get("pattern") orelse return false;
+    if (pat != .object) return false;
+    const rx = pat.object.get("Regex") orelse return false;
+    if (rx != .string) return false;
+    return std.mem.eql(u8, rx.string, "\\p{N}{1,3}");
 }
 
 /// Parse one BPE merge entry, accepting both on-disk formats:
@@ -1432,12 +1477,16 @@ test "WordPiece encode lowercases input" {
 // Helper for pre-tokenizer tests: run gpt2PreTokenize and compare the
 // emitted word strings to an expected slice. Owns the dupe'd word memory.
 fn expectPreTokens(allocator: std.mem.Allocator, input: []const u8, expected: []const []const u8) !void {
+    return expectPreTokensG(allocator, input, 1, expected);
+}
+
+fn expectPreTokensG(allocator: std.mem.Allocator, input: []const u8, digit_group: u8, expected: []const []const u8) !void {
     var words: std.ArrayList([]const u8) = .empty;
     defer {
         for (words.items) |w| allocator.free(w);
         words.deinit(allocator);
     }
-    try gpt2PreTokenize(allocator, input, &words);
+    try gpt2PreTokenize(allocator, input, digit_group, &words);
     if (words.items.len != expected.len) {
         std.debug.print("\n  pre-tokenize on {s}: got {d} words, expected {d}\n", .{
             input, words.items.len, expected.len,
@@ -1487,6 +1536,40 @@ test "gpt2PreTokenize: digits are single-codepoint pre-tokens" {
     // BPE will not merge across pre-tokens, so this drives final token IDs.
     try expectPreTokens(testing.allocator, "100", &.{ "1", "0", "0" });
     try expectPreTokens(testing.allocator, " 100", &.{ " ", "1", "0", "0" });
+}
+
+test "gpt2PreTokenize: {1,3} digit groups when the spec declares them (DSV4 class)" {
+    // DeepSeek-V4's tokenizer.json isolates digit runs with `\p{N}{1,3}` —
+    // greedy left-to-right groups of up to three. Our per-digit splitting fed
+    // the model an alien segmentation of every number: the ROOT CAUSE of the
+    // echo-precision slip class (`1o` for `10`, o-for-0, split digits) that
+    // was chased through expert quantization for days. Reference HF ids for
+    // "1048576": [104][857][6]; our per-digit split can never produce them.
+    try expectPreTokensG(testing.allocator, "1048576", 3, &.{ "104", "857", "6" });
+    try expectPreTokensG(testing.allocator, "100", 3, &.{"100"});
+    try expectPreTokensG(testing.allocator, " 100 units", 3, &.{ " ", "100", " units" });
+    try expectPreTokensG(testing.allocator, "26.7.12", 3, &.{ "26", ".", "7", ".", "12" });
+    try expectPreTokensG(testing.allocator, "v2", 3, &.{ "v", "2" });
+    // group 1 keeps the Qwen behavior byte-identical
+    try expectPreTokensG(testing.allocator, "1048576", 1, &.{ "1", "0", "4", "8", "5", "7", "6" });
+}
+
+test "tokenizer.json digit-group parse: {1,3} Split rule sets digit_group 3" {
+    const json_13 =
+        \\{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    var p1 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_13, .{});
+    defer p1.deinit();
+    try testing.expectEqual(@as(u8, 3), digitGroupFromPreTokenizer(p1.value));
+
+    const json_single =
+        \\{"type":"ByteLevel"}
+    ;
+    var p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, json_single, .{});
+    defer p2.deinit();
+    try testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(p2.value));
 }
 
 test "gpt2PreTokenize: newline run after whitespace" {
