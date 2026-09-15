@@ -88,6 +88,8 @@ pub const Tokenizer = struct {
     /// markers decode as the canonical `<think>` / GLM tag spellings every
     /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
     marker_aliases: ?std.AutoHashMap(u32, []const u8) = null,
+    /// K2 think opener id -> its own closer id (three pairs, one per effort).
+    marker_closers: ?std.AutoHashMap(u32, u32) = null,
     /// Byte-to-unicode mapping for byte-level BPE (256 entries, index = byte value)
     byte_to_unicode: [256]u21,
     /// Unicode-to-byte reverse mapping
@@ -155,6 +157,7 @@ pub const Tokenizer = struct {
         // parsed JSON deinits its arena in one shot.
         if (self.flagged_specials.len > 0) self.allocator.free(self.flagged_specials);
         if (self.marker_aliases) |*m| m.deinit();
+        if (self.marker_closers) |*m| m.deinit();
         if (self.parsed_json) |*p| {
             self.vocab.deinit();
             self.id_to_token.deinit();
@@ -321,8 +324,26 @@ pub const Tokenizer = struct {
         for (pairs) |pair| {
             if (self.special_tokens.get(pair[0])) |id| map.put(id, pair[1]) catch return false;
         }
+        var closers = std.AutoHashMap(u32, u32).init(self.allocator);
+        errdefer closers.deinit();
+        for ([_][2][]const u8{
+            .{ "<ifm|think>", "</ifm|think>" },
+            .{ "<ifm|think_fast>", "</ifm|think_fast>" },
+            .{ "<ifm|think_faster>", "</ifm|think_faster>" },
+        }) |pair| {
+            const open = self.special_tokens.get(pair[0]) orelse continue;
+            const close = self.special_tokens.get(pair[1]) orelse continue;
+            closers.put(open, close) catch return false;
+        }
         self.marker_aliases = map;
+        self.marker_closers = closers;
         return true;
+    }
+
+    /// The atomic closer paired with a K2 think opener id; null for every other id.
+    pub fn markerCloserFor(self: *const Tokenizer, opener_id: u32) ?u32 {
+        const m = self.marker_closers orelse return null;
+        return m.get(opener_id);
     }
 
     /// Reserved-output ids for this tokenizer: `reservedOutputIds` over the
@@ -2347,4 +2368,25 @@ test "K2-Horizon markers decode to the canonical think / GLM tool-tag spellings"
     );
     // Encoding the marker text still lands on the special id: the alias is decode-only.
     try testing.expectEqual(@as(?u32, 0), tok.specialTokenId("<ifm|think>"));
+}
+
+test "markerCloserFor: K2 think openers pair with their own closer" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    const specials = [_][]const u8{
+        "<ifm|think>",      "</ifm|think>",      "<ifm|think_fast>",   "</ifm|think_fast>",
+        "<ifm|think_faster>", "</ifm|think_faster>", "<ifm|tool_calls>", "</ifm|tool_calls>",
+    };
+    for (specials, 0..) |t, i| {
+        try tok.id_to_token.put(@intCast(i), t);
+        try tok.special_tokens.put(try allocator.dupe(u8, t), @intCast(i));
+    }
+    try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(0));
+    try testing.expect(tok.installMarkerAliases());
+    try testing.expectEqual(@as(?u32, 1), tok.markerCloserFor(0));
+    try testing.expectEqual(@as(?u32, 3), tok.markerCloserFor(2));
+    try testing.expectEqual(@as(?u32, 5), tok.markerCloserFor(4));
+    try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
+    try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
 }
