@@ -211,6 +211,7 @@ pub extern "c" fn mlx_sin(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_hadamard_transform(res: *mlx_array, a: mlx_array, scale: mlx_optional_float, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_expand_dims(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
@@ -346,6 +347,7 @@ pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_me
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
 pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
