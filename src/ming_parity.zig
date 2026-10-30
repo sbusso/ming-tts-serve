@@ -99,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
     eng.normalize_prompt = false;
     eng.soft_limit = false;
     eng.guard = false;
+    engine.text.french_frontend = false;
     defer eng.deinit();
     const m = eng.model;
 

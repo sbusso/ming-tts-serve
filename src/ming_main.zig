@@ -65,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "serve")) return serve(io, a, cfg);
     if (std.mem.eql(u8, cmd, "say")) return say(io, a, cfg, json_arg orelse return usage(), out_path orelse return usage());
     if (std.mem.eql(u8, cmd, "bench")) return bench(io, a, cfg, runs);
+    if (std.mem.eql(u8, cmd, "frontend")) return frontend(io, a, cfg, json_arg orelse return usage());
     return usage();
 }
 
@@ -74,6 +75,7 @@ fn usage() void {
         \\  ming-tts serve --model DIR [--host 127.0.0.1] [--port 8765] [--output-dir DIR]
         \\  ming-tts say   --model DIR --out x.wav --json '{{"task":"IP","text":"Hi.","voice":"UK_George"}}'
         \\  ming-tts bench --model DIR [--runs 3]
+        \\  ming-tts frontend --model DIR --json '[{{"task":"TTS","text":"..."}}]'   (fragments + token ids, no model load)
         \\
     , .{});
 }
@@ -257,4 +259,66 @@ fn bench(io: std.Io, a: Allocator, cfg: Config, runs: usize) !void {
         std.mem.sort(f64, durs.items, {}, std.sort.asc(f64));
         std.debug.print("zig        {s:<7} rtf={d:.3}  audio={d:.2}s\n", .{ c.name, rtfs.items[rtfs.items.len / 2], durs.items[durs.items.len / 2] });
     }
+}
+
+/// Text frontend dump for comparison with the Python one: for each request,
+/// the prompt, the fragments `prepare_text` makes and each fragment's token
+/// ids (no speaker slot, no prompt transcript). Loads only the tokenizer.
+fn frontend(io: std.Io, a: Allocator, cfg: Config, json: []const u8) !void {
+    if (std.c.getenv("MING_FR_TN")) |v| ming.text.french_frontend = !std.mem.eql(u8, std.mem.span(v), "0");
+    var tok = try @import("tokenizer.zig").loadTokenizerAny(io, a, cfg.model_dir);
+    defer tok.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.append(a, '[');
+    for (parsed.value.array.items, 0..) |item, k| {
+        const o = item.object;
+        var perr: ?ApiError = null;
+        const r: ming.GenerateRequest = .{
+            .task = o.get("task").?.string,
+            .text = o.get("text").?.string,
+            .language = optStr(o, "language", &perr, a),
+            .voice = optStr(o, "voice", &perr, a),
+            .prompt_wav_path = optStr(o, "prompt_wav_path", &perr, a),
+            .prompt_text = optStr(o, "prompt_text", &perr, a),
+        };
+        var d: ming.Diag = .{};
+        // The upstream kwargs directly (no API.md reference checks).
+        var in: ming.text.TaskInput = .{ .task = r.task, .text = r.text, .language_id = r.language };
+        if (r.voice) |v| in.controls.ip = v;
+        const req = ming.text.buildRequest(a, in, &d) catch |e| {
+            std.debug.print("error: {s}\n", .{d.msg()});
+            return e;
+        };
+        defer req.deinit(a);
+        var frags = try ming.text.prepareText(a, req.text, req.text_language, 24);
+        defer {
+            for (frags.items) |f| a.free(f);
+            frags.deinit(a);
+        }
+        if (k > 0) try out.append(a, ',');
+        try out.appendSlice(a, "\n{\"text\":");
+        try ming.text.jsonStr(a, &out, r.text);
+        try out.appendSlice(a, ",\"prompt\":");
+        try ming.text.jsonStr(a, &out, req.prompt);
+        try out.appendSlice(a, ",\"fragments\":[");
+        for (frags.items, 0..) |f, i| {
+            if (i > 0) try out.append(a, ',');
+            try ming.text.jsonStr(a, &out, f);
+        }
+        try out.appendSlice(a, "],\"ids\":[");
+        for (frags.items, 0..) |f, i| {
+            if (i > 0) try out.append(a, ',');
+            var ii = try ming.text.buildInputIds(a, &tok, req.prompt, f, 0, req.instruction, null, 0);
+            defer ii.deinit(a);
+            try out.append(a, '[');
+            for (ii.ids, 0..) |id, j| try out.print(a, "{s}{d}", .{ if (j > 0) "," else "", id });
+            try out.append(a, ']');
+        }
+        try out.appendSlice(a, "]}");
+    }
+    try out.appendSlice(a, "]\n");
+    std.debug.print("{s}", .{out.items});
 }

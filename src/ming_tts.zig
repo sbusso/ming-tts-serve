@@ -125,6 +125,18 @@ pub const Engine = struct {
 
     /// POST /clone: zero-shot clone from a reference clip (+ transcript).
     pub fn clone(e: *Engine, txt: []const u8, prompt_wav_path: []const u8, prompt_text: ?[]const u8, seed: ?u64, d: *Diag) ![]f32 {
+        // French, German, Spanish, Japanese or Korean text through the zh/en TTS
+        // path loses its accents and gets English number expansion (upstream
+        // behavior: "Bonjour à tous" becomes "Bonjour ， tous"; French WER 0.53
+        // vs 0.04). Route it to MULTILINGUAL, which needs the transcript.
+        if (prompt_text != null) if (text.detectLanguage(txt)) |lang| {
+            var md: Diag = .{};
+            const in: text.TaskInput = .{ .task = "MULTILINGUAL", .text = txt, .language_id = lang, .prompt_wav_path = prompt_wav_path, .prompt_text = prompt_text, .use_spk_emb = true };
+            if (text.buildRequest(e.a, in, &md)) |req| {
+                req.deinit(e.a);
+                return e.synthesize(in, seed);
+            } else |_| {}
+        };
         return e.synthesizeChecked(.{
             .task = "TTS",
             .text = txt,
@@ -188,6 +200,14 @@ pub const Engine = struct {
             if (prof) lap(e.io, &t, "VAE encode");
         }
         var prompt_text: ?[]const u8 = if (prompt_latent != null) req.prompt_text else null;
+        // The reference transcript gets the same French spelling as the text, so
+        // "20 secondes" in it matches the "vingt secondes" that was spoken.
+        const fr_prompt_text: ?[]u8 = if (prompt_text != null and text.french_frontend and text.isFrench(req.text_language))
+            try @import("ming_fr.zig").normalize(a, prompt_text.?)
+        else
+            null;
+        defer if (fr_prompt_text) |x| a.free(x);
+        if (fr_prompt_text) |x| prompt_text = x;
         if (prompt_text == null) if (prompt_latent) |x| {
             _ = mlx.mlx_array_free(x);
             prompt_latent = null;

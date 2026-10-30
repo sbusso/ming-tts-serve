@@ -1404,8 +1404,51 @@ pub fn preserveMultilingual(language_id: ?[]const u8) bool {
     return true;
 }
 
+/// French number spelling and typography (ming_fr.zig) for language fr.
+/// Departs from upstream, which passes French text through as written.
+pub var french_frontend: bool = true;
+
+pub fn isFrench(language_id: ?[]const u8) bool {
+    const l = strip(language_id orelse return false);
+    return std.ascii.eqlIgnoreCase(l, "fr") or std.ascii.eqlIgnoreCase(l, "french") or std.ascii.startsWithIgnoreCase(l, "fr-") or std.ascii.startsWithIgnoreCase(l, "fr_");
+}
+
+/// MULTILINGUAL fr/de/es: the cutter rewrites the punctuation it splits on
+/// to the Chinese full-width forms ("Bonjour à tous，voici …。"), as upstream
+/// does. Put the ASCII forms back (Latin-script languages only; Japanese
+/// keeps 、。). Part of the `french_frontend` departure.
+fn isLatinMultilingual(language_id: ?[]const u8) bool {
+    const l = strip(language_id orelse return false);
+    for ([_][]const u8{ "fr", "french", "de", "german", "es", "spanish" }) |x| if (std.ascii.eqlIgnoreCase(l, x)) return true;
+    return isFrench(language_id);
+}
+
+fn restoreAsciiPunct(a: std.mem.Allocator, f: *std.ArrayList(Cp)) !void {
+    var out: std.ArrayList(Cp) = .empty;
+    errdefer out.deinit(a);
+    for (f.items, 0..) |c, i| {
+        const ascii: ?Cp = switch (c) {
+            0xFF0C => ',', // ，
+            0x3002 => '.', // 。
+            0xFF01 => '!',
+            0xFF1F => '?',
+            0xFF1B => ';',
+            0xFF1A => ':',
+            else => null,
+        };
+        try out.append(a, ascii orelse c);
+        // "tous，voici" → "tous, voici"
+        if (ascii != null and i + 1 < f.items.len and !isSpace(f.items[i + 1])) try out.append(a, ' ');
+    }
+    f.deinit(a);
+    f.* = out;
+}
+
 /// MingMLX.prepare_text: text → synthesizable fragments (owned UTF-8).
-pub fn prepareText(a: std.mem.Allocator, text_utf8: []const u8, language_id: ?[]const u8, max_len: usize) !std.ArrayList([]u8) {
+pub fn prepareText(a: std.mem.Allocator, text_in: []const u8, language_id: ?[]const u8, max_len: usize) !std.ArrayList([]u8) {
+    const fr_text: ?[]u8 = if (french_frontend and isFrench(language_id)) try @import("ming_fr.zig").normalize(a, text_in) else null;
+    defer if (fr_text) |t| a.free(t);
+    const text_utf8 = fr_text orelse text_in;
     var s = try decode(a, text_utf8);
     defer s.deinit(a);
     try stripMarkdownCode(a, &s);
@@ -1418,8 +1461,10 @@ pub fn prepareText(a: std.mem.Allocator, text_utf8: []const u8, language_id: ?[]
         for (out.items) |x| a.free(x);
         out.deinit(a);
     }
+    const latin = french_frontend and isLatinMultilingual(language_id);
     for (frags.items) |*f| {
         if (stripSlice(f.items).len == 0) continue;
+        if (latin) try restoreAsciiPunct(a, f);
         if (!multilingual) try protectTags(a, f);
         if (stripSlice(f.items).len == 0) continue;
         try out.append(a, try encode(a, f.items));
@@ -1726,12 +1771,98 @@ pub const InputIds = struct {
 };
 
 /// `encode` is any tokenizer with `encode(allocator, text) ![]u32` (no BOS/EOS).
+// ── NFC (the tokenizer's normalizer) ──
+
+const nfc_table = @import("ming_nfc_table.zig").pairs;
+
+fn composePair(base: u21, mark: u21) ?u21 {
+    // Hangul: L + V → LV, LV + T → LVT (Unicode §3.12).
+    const S_BASE = 0xAC00;
+    const L_BASE = 0x1100;
+    const V_BASE = 0x1161;
+    const T_BASE = 0x11A7;
+    if (base >= L_BASE and base < L_BASE + 19 and mark >= V_BASE and mark < V_BASE + 21)
+        return S_BASE + ((base - L_BASE) * 21 + (mark - V_BASE)) * 28;
+    if (base >= S_BASE and base < S_BASE + 11172 and (base - S_BASE) % 28 == 0 and mark > T_BASE and mark < T_BASE + 28)
+        return base + (mark - T_BASE);
+    var lo: usize = 0;
+    var hi: usize = nfc_table.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const p = nfc_table[mid];
+        if (p.base == base and p.mark == mark) return p.composed;
+        if (p.base < base or (p.base == base and p.mark < mark)) lo = mid + 1 else hi = mid;
+    }
+    return null;
+}
+
+/// Unicode NFC for text that is NFC already or canonically decomposed
+/// (NFD), which is what keyboards and macOS paste produce. Caller frees.
+/// Ceiling: no canonical reordering of several marks on one base and no
+/// decomposition of precomposed input, so a non-canonical mark order or
+/// mixed precomposed + combining text can differ from full NFC. Upgrade
+/// path: generate the decomposition and combining-class tables too.
+pub fn nfc(a: std.mem.Allocator, s: []const u8) ![]u8 {
+    var view = std.unicode.Utf8View.init(s) catch return a.dupe(u8, s);
+    var it = view.iterator();
+    var cps: std.ArrayList(u21) = .empty;
+    defer cps.deinit(a);
+    var starter: ?usize = null;
+    var changed = false;
+    while (it.nextCodepoint()) |cp| {
+        if (starter) |i| if (composePair(cps.items[i], cp)) |c| {
+            cps.items[i] = c;
+            changed = true;
+            continue;
+        };
+        try cps.append(a, cp);
+        if (!isCombiningMark(cp)) starter = cps.items.len - 1;
+    }
+    if (!changed) return a.dupe(u8, s);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (cps.items) |cp| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(cp, &buf);
+        try out.appendSlice(a, buf[0..n]);
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn isCombiningMark(cp: u21) bool {
+    return (cp >= 0x0300 and cp <= 0x036F) or (cp >= 0x1AB0 and cp <= 0x1AFF) or (cp >= 0x1DC0 and cp <= 0x1DFF) or
+        (cp >= 0x20D0 and cp <= 0x20FF) or (cp >= 0xFE20 and cp <= 0xFE2F) or cp == 0x3099 or cp == 0x309A or
+        (cp >= 0x0591 and cp <= 0x05C7) or (cp >= 0x0610 and cp <= 0x061A) or (cp >= 0x064B and cp <= 0x065F) or
+        (cp >= 0x1161 and cp <= 0x11FF); // Hangul V/T jamo continue a syllable
+}
+
+test "nfc composes French, Vietnamese stacking, kana and Hangul" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "e\u{301}te\u{301} a\u{300} c\u{327}a o\u{302}", "été à ça ô" },
+        .{ "e\u{323}\u{302}", "ệ" },
+        .{ "か\u{3099}", "が" },
+        .{ "\u{1112}\u{1161}\u{11AB}", "한" },
+        .{ "déjà", "déjà" },
+    };
+    for (cases) |c| {
+        const got = try nfc(a, c[0]);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}
+
 pub fn buildInputIds(a: std.mem.Allocator, tok: anytype, prompt: []const u8, text_: []const u8, num_speakers: usize, instruction: ?[]const u8, prompt_text: ?[]const u8, prompt_latent_steps: usize) !InputIds {
     var ids: std.ArrayList(i32) = .empty;
     errdefer ids.deinit(a);
     const Enc = struct {
         fn add(al: std.mem.Allocator, t: anytype, list: *std.ArrayList(i32), s: []const u8) !void {
-            const e = try t.encode(al, s);
+            // tokenizer.json declares an NFC normalizer that tokenizer.zig does
+            // not apply; without it NFD input (e + U+0301, common from macOS
+            // paste) tokenizes differently from upstream.
+            const n = try nfc(al, s);
+            defer al.free(n);
+            const e = try t.encode(al, n);
             defer al.free(e);
             for (e) |x| try list.append(al, @intCast(x));
         }
@@ -1790,4 +1921,89 @@ test "numberToWords matches inflect" {
     const o = try ordinalWords(a, "twenty-one");
     defer a.free(o);
     try std.testing.expectEqualStrings("twenty-first", o);
+}
+
+// ── Text language guess (for routing French/German/Spanish/Japanese/Korean to MULTILINGUAL) ──
+
+/// Best guess at the language of `text`: "ja", "ko", "fr", "de", "es", or
+/// null for Chinese/English (what plain TTS handles) and anything unclear.
+/// Script ranges decide ja/ko; Latin text is scored on stopwords and
+/// language-specific letters. A heuristic: short or mixed text can be wrong,
+/// so callers suggest rather than override when the user chose a task.
+pub fn detectLanguage(text_utf8: []const u8) ?[]const u8 {
+    var view = std.unicode.Utf8View.init(text_utf8) catch return null;
+    var it = view.iterator();
+    var kana: usize = 0;
+    var hangul: usize = 0;
+    var han: usize = 0;
+    var score = [_]usize{ 0, 0, 0, 0 }; // en fr de es
+    var word: [32]u8 = undefined;
+    var wl: usize = 0;
+    var latin_words: usize = 0;
+    while (true) {
+        const cp_opt = it.nextCodepoint();
+        const cp: u21 = cp_opt orelse ' ';
+        if ((cp >= 0x3040 and cp <= 0x30FF) or (cp >= 0x31F0 and cp <= 0x31FF)) kana += 1;
+        if ((cp >= 0xAC00 and cp <= 0xD7A3) or (cp >= 0x1100 and cp <= 0x11FF) or (cp >= 0x3130 and cp <= 0x318F)) hangul += 1;
+        if (cp >= 0x4E00 and cp <= 0x9FFF) han += 1;
+        switch (cp) {
+            'é', 'è', 'ê', 'à', 'ù', 'ç', 'œ', 'â', 'î', 'ô', 'û', 'ë', 'ï', 'É', 'È', 'À', 'Ç' => score[1] += 2,
+            'ä', 'ö', 'ü', 'ß', 'Ä', 'Ö', 'Ü' => score[2] += 2,
+            'ñ', 'á', 'í', 'ó', 'ú', '¿', '¡', 'Ñ' => score[3] += 2,
+            0x0300...0x036F => {}, // NFD marks: the letters before them are scored as words below
+            else => {},
+        }
+        const letter = (cp < 128 and std.ascii.isAlphabetic(@intCast(cp))) or (cp >= 0xC0 and cp <= 0x24F) or cp == '\'' or cp == 0x2019;
+        if (letter) {
+            if (cp < 128 and wl < word.len) {
+                word[wl] = std.ascii.toLower(@intCast(cp));
+                wl += 1;
+            } else if (wl < word.len) {
+                word[wl] = '*'; // non-ASCII letter inside the word
+                wl += 1;
+            }
+        } else if (wl > 0) {
+            latin_words += 1;
+            const w = word[0..wl];
+            for (stopwords, 0..) |list, li| for (list) |sw| if (std.mem.eql(u8, w, sw)) {
+                score[li] += 1;
+            };
+            wl = 0;
+        }
+        if (cp_opt == null) break;
+    }
+    if (kana > 0) return "ja";
+    if (hangul > 0) return "ko";
+    if (han > 0 and han * 2 >= latin_words) return null;
+    var best: usize = 0;
+    for (score, 0..) |sc, i| if (sc > score[best]) {
+        best = i;
+    };
+    if (best == 0 or score[best] < 3 or score[best] <= score[0]) return null;
+    return ([_][]const u8{ "en", "fr", "de", "es" })[best];
+}
+
+const stopwords = [_][]const []const u8{
+    &.{ "the", "and", "is", "are", "of", "to", "in", "it", "you", "that", "this", "with", "for", "was", "have", "not", "be", "on", "at", "we", "they", "what", "my", "your" },
+    &.{ "le", "la", "les", "un", "une", "des", "et", "est", "je", "tu", "il", "elle", "nous", "vous", "ils", "pas", "ne", "que", "qui", "du", "de", "pour", "dans", "sur", "avec", "c'est", "mais", "ce", "cette", "au", "aux", "mon", "ma", "bonjour", "oui", "non", "j'ai", "l'", "d'", "qu'", "n'est" },
+    &.{ "der", "die", "das", "und", "ist", "ich", "du", "er", "sie", "wir", "ihr", "nicht", "ein", "eine", "mit", "auf", "zu", "den", "dem", "von", "es", "guten", "heute", "auch", "sind", "wie" },
+    &.{ "el", "los", "las", "y", "es", "yo", "tu", "que", "no", "una", "con", "por", "para", "del", "se", "lo", "como", "pero", "hola", "buenos", "hoy", "muy", "est*", "vamos", "hace" },
+};
+
+test "detectLanguage" {
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "Bonjour à tous, voici un essai de voix en français.", "fr" },
+        .{ "Il a soixante ans et il est arrivé hier.", "fr" },
+        .{ "Guten Morgen, heute scheint die Sonne und wir gehen in den Park.", "de" },
+        .{ "Buenos días, hoy hace buen tiempo y vamos a caminar por la playa.", "es" },
+        .{ "おはようございます。今日はいい天気ですね。", "ja" },
+        .{ "안녕하세요. 오늘은 날씨가 좋네요.", "ko" },
+        .{ "The garden stays open until sunset, and visitors leave by the north gate.", null },
+        .{ "今天天气很好，我们一起去公园散步吧。", null },
+        .{ "Café latte.", null },
+    };
+    for (cases) |c| {
+        const got = detectLanguage(c[0]);
+        if (c[1]) |want| try std.testing.expectEqualStrings(want, got orelse "null") else try std.testing.expectEqual(@as(?[]const u8, null), got);
+    }
 }

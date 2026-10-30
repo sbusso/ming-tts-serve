@@ -142,6 +142,7 @@ fn worker(st: *State) void {
     if (std.c.getenv("MING_PROMPT_NORM")) |v| eng.normalize_prompt = !std.mem.eql(u8, std.mem.span(v), "0");
     if (std.c.getenv("MING_SOFT_LIMIT")) |v| eng.soft_limit = !std.mem.eql(u8, std.mem.span(v), "0");
     if (std.c.getenv("MING_GUARD")) |v| eng.guard = !std.mem.eql(u8, std.mem.span(v), "0");
+    if (std.c.getenv("MING_FR_TN")) |v| ming.text.french_frontend = !std.mem.eql(u8, std.mem.span(v), "0");
     // Compile Metal kernels once so the first request is not slow.
     var d: ming.Diag = .{};
     if (eng.tts("Warm up.", "UK_George", null, 0, &d)) |w| {
