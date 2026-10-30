@@ -194,7 +194,7 @@ zig-out/bin/ming-tts frontend --json '[{"task":"TTS","text":"Bonjour à tous."}]
 
 ## Long text
 
-Requests accept up to 50,000 characters by default (about an hour of speech; `MING_MAX_TEXT_CHARS` changes the limit). The engine splits the text and generates it one fragment at a time, so GPU memory stays the same for any length; the finished audio takes about 10.6 MB of memory per minute. Generation runs at about 0.11 s per second of audio: a 5-minute text takes about 35 seconds on an M5 Max.
+Requests accept up to 50,000 characters by default (about an hour of speech; `MING_MAX_TEXT_CHARS` changes the limit). The engine splits the text and generates it one fragment at a time and frees MLX's buffer cache after each one, so GPU memory stays the same for any length (peak memory footprint of `ming-tts say` about 5.5 GB for 5 minutes, against 31 GB without freeing the cache); the finished audio takes about 10.6 MB of memory per minute. Generation runs at about 0.11 s per second of audio: a 5-minute text takes about 35 seconds on an M5 Max.
 
 How the text is split:
 
@@ -213,7 +213,9 @@ The values follow the model's own pauses inside a fragment: on a 5-minute Englis
 
 `MING_JOIN=0` turns this off and concatenates the fragments as upstream does (each fragment keeps up to 300 ms of trailing silence and all of its leading silence, whatever the boundary).
 
-Measured on 5-minute English (built-in voice and clone) and 2.5-minute French (clone) texts: Whisper word error rate 0.9 to 2.5 % (mostly digits versus spelled numbers), CAM++ similarity between the first and last 30 seconds 0.95 to 0.98, no clipped samples, and fragment speech levels within ±1 dB (largest jump between neighbors 2.6 dB).
+Measured on 5-minute English (built-in voice and clone) and 2.5-minute French (clone) texts: Whisper word error rate 0.4 to 2.7 % (mostly digits versus spelled numbers), CAM++ similarity between the first and last 30 seconds 0.95 to 0.98, no clipped samples, and fragment speech levels within ±1 dB (largest jump between neighbors 2.6 dB). Every fragment is generated from the same prompt with no state carried over, so voice and speaking rate do not drift: the per-fragment speaking rate changes by -3 % to +3 % from the first to the last quarter of the English texts, which is the spread of the text itself.
+
+Breaths: the model's `[Breathing]` tag at the start of a paragraph was tested and is not used. Over 40 tagged clips (10 sentences in English, French and Chinese, 4 voices, 4 seeds each), an audible breath (0.2 s or more before the speech) appeared in 22; it lowered CAM++ similarity to the untagged clip (0.82 to 0.91, against 0.89 to 0.94 between seeds) and added a character error to the first word in 3 of 8 Chinese clips. No words were inserted.
 
 ## Run the server
 
@@ -254,6 +256,7 @@ These switches change engine behavior. They exist for A/B comparisons and diagno
 | `MING_GUARD` | on | Regenerate text fragments whose speaking rate is implausible. |
 | `MING_FR_TN` | on | French text normalization for MULTILINGUAL with language `fr`: spells out numbers, times and amounts, and flattens French typography. |
 | `MING_JOIN` | on | Join text fragments with pauses by boundary (see [Long text](#long-text)). `0` concatenates them as upstream does. |
+| `MING_CLEAR_CACHE` | on | Free MLX's buffer cache after each fragment of a multi-fragment text. Output is unchanged; `0` keeps the cache, which grows with the text. |
 | `MING_PROFILE` | off | Any value prints per-step timing and step budgets to stderr. |
 
 With `MING_FUSED=0`, `MING_PROMPT_NORM=0`, `MING_SOFT_LIMIT=0`, `MING_GUARD=0`, `MING_FR_TN=0` and `MING_JOIN=0`, the engine follows the upstream Ming pipeline op for op.

@@ -206,7 +206,8 @@ fn worker(st: *State) void {
 }
 
 /// A/B switches for the deliberate departures from upstream ("0" turns one
-/// off): MING_PROMPT_NORM, MING_SOFT_LIMIT, MING_GUARD, MING_FR_TN, MING_JOIN.
+/// off): MING_PROMPT_NORM, MING_SOFT_LIMIT, MING_GUARD, MING_FR_TN, MING_JOIN,
+/// MING_CLEAR_CACHE.
 pub fn configure(eng: *ming.Engine) void {
     const off = struct {
         fn f(name: [*:0]const u8) ?bool {
@@ -219,6 +220,7 @@ pub fn configure(eng: *ming.Engine) void {
     if (off("MING_GUARD")) |x| eng.guard = !x;
     if (off("MING_FR_TN")) |x| ming.text.french_frontend = !x;
     if (off("MING_JOIN")) |x| eng.join = !x;
+    if (off("MING_CLEAR_CACHE")) |x| eng.clear_cache = !x;
 }
 
 /// Run one clone on `samples` so the prompt path (resampler, CAM++, VAE

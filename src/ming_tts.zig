@@ -112,6 +112,10 @@ pub const Engine = struct {
     /// Multiplies the boundary pauses for the next `synthesize` calls (0 to
     /// MAX_PAUSE_SCALE). The gap never goes below LEAD_PAD_S + TAIL_PAD_S.
     pause_scale: f32 = 1,
+    /// Free MLX's buffer cache after each fragment of a multi-fragment text.
+    /// Fragments have different lengths, so cached buffers rarely get reused
+    /// and the cache otherwise grows with the text.
+    clear_cache: bool = true,
     a: std.mem.Allocator,
     io: std.Io,
     s: model.S,
@@ -345,6 +349,16 @@ pub const Engine = struct {
                 if (prof) std.debug.print("[ming] pause at {d:.2}s: {s} {d:.0} ms\n", .{ @as(f64, @floatFromInt(out.items.len)) / SAMPLE_RATE, @tagName(f.after), gap * 1000 });
                 try e.emitSilence(&out, tail_fill + nsamp(@max(0, gap - LEAD_PAD_S - TAIL_PAD_S)));
             }
+            if (prof) {
+                var act: usize = 0;
+                var cache: usize = 0;
+                var peak: usize = 0;
+                _ = mlx.mlx_get_active_memory(&act);
+                _ = mlx.mlx_get_cache_memory(&cache);
+                _ = mlx.mlx_get_peak_memory(&peak);
+                std.debug.print("[ming] mlx memory after frag {d}: active {d} MB, cache {d} MB, peak {d} MB\n", .{ i, act >> 20, cache >> 20, peak >> 20 });
+            }
+            if (e.clear_cache and last > 0) _ = mlx.mlx_clear_cache();
             units_done += text.spokenUnits(frag);
             e.report(.{ .done = i + 1, .total = frags.items.len, .units_done = units_done, .units_total = units_total, .audio_s = @as(f64, @floatFromInt(out.items.len)) / SAMPLE_RATE });
         }
