@@ -36,12 +36,26 @@ pub const D = 1024;
 pub const FF = 4096;
 pub const MAX_ROWS = 6;
 /// GEMV tile: output columns per threadgroup, simdgroups per threadgroup
-/// (they split K), elements per lane per block (multiple of 4).
-const Tile = struct { no: c_int, sg: c_int, vw: c_int };
+/// (they split K).
+const Tile = struct { no: c_int, sg: c_int };
 
+/// MING_FUSED=0 turns every fused path off; MING_FUSED_DIT=0 / MING_FUSED_LM=0
+/// turn off one part (A/B checks).
 pub fn enabled() bool {
-    const v = std.c.getenv("MING_FUSED") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(v), "0");
+    return !envOff("MING_FUSED");
+}
+
+pub fn ditEnabled() bool {
+    return enabled() and !envOff("MING_FUSED_DIT");
+}
+
+pub fn lmEnabled() bool {
+    return enabled() and !envOff("MING_FUSED_LM");
+}
+
+fn envOff(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
 }
 
 const HEADER =
@@ -56,10 +70,10 @@ const HEADER =
     \\    for (int g = 0; g < sgn; g++) a += red[(g * no + n) * rows + r];
     \\    return a;
     \\}
-    \\inline float rinv_(threadgroup const float* ssr, int sgn, int rows, int r) {
+    \\inline float rinv_(threadgroup const float* ssr, int sgn, int rows, int r, int kd) {
     \\    float a = 0.0f;
     \\    for (int g = 0; g < sgn; g++) a += ssr[g * rows + r];
-    \\    return metal::precise::rsqrt(a / 1024.0f + 1e-6f);
+    \\    return metal::precise::rsqrt(a / float(kd) + 1e-6f);
     \\}
     \\
 ;
@@ -75,27 +89,25 @@ const PRELUDE =
 ;
 
 /// Partial dot products of the threadgroup's NO output columns over all R
-/// rows. SG simdgroups split K; a lane takes VW consecutive elements per
-/// 32*VW-wide block. `wp` is column 0's weight row; `xv` loads float4 of row
-/// r at i. With `norm`, the rows are rms-normed on the fly: the sum of squares
+/// rows, summed into `red`. SG simdgroups take 128-wide blocks of K round
+/// robin; a lane reads 4 consecutive bf16 per block (one 8-byte load per
+/// weight row). `wrow` is column n's weight row; `xv` loads float4 of row r
+/// at i. With `norm`, the rows are rms-normed on the fly: the sum of squares
 /// rides along in `ss`, the norm weight NW scales x here, and 1/rms is applied
 /// in the epilogue (MLX instead rounds w * T(x * inv) to bf16 per element; the
 /// difference is below the bf16 rounding of the output).
-fn gemv(comptime k: usize, comptime wp: []const u8, comptime xv: []const u8, comptime norm: bool) []const u8 {
+fn gemv(comptime k: usize, comptime wrow: []const u8, comptime xv: []const u8, comptime norm: bool) []const u8 {
     return std.fmt.comptimePrint(
         \\{{
-        \\const device bfloat16_t* wp = {1s};
         \\float acc[NO][R];
         \\float ss[R];
         \\for (int r = 0; r < R; r++) {{ ss[r] = 0.0f; for (int n = 0; n < NO; n++) acc[n][r] = 0.0f; }}
-        \\for (int b = int(sg) * ({0d} / SG); b < (int(sg) + 1) * ({0d} / SG); b += 32 * VW)
-        \\for (int u = 0; u < VW; u += 4) {{
-        \\    const int i = b + int(lane) * VW + u;
+        \\for (int i = int(sg) * 128 + int(lane) * 4; i < {0d}; i += SG * 128) {{
         \\    float4 xv[R];
         \\    for (int r = 0; r < R; r++) xv[r] = {2s};
         \\    {3s}
         \\    for (int n = 0; n < NO; n++) {{
-        \\        const float4 w = LDW(wp + n * {0d}, i);
+        \\        const float4 w = LDW({1s}, i);
         \\        for (int r = 0; r < R; r++) acc[n][r] += dot(w, xv[r]);
         \\    }}
         \\}}
@@ -108,19 +120,17 @@ fn gemv(comptime k: usize, comptime wp: []const u8, comptime xv: []const u8, com
         \\}}
         \\threadgroup_barrier(mem_flags::mem_threadgroup);
         \\}}
+        \\#define rsum(n, r) rsum_(red, SG, NO, R, n, r)
+        \\#define rinv(r) rinv_(ssr, SG, R, r, {0d})
         \\
     , .{
-        k,                                                                                                                          wp,                                                                                                xv,
-        if (norm) "const float4 nw = LDW(NW, i); for (int r = 0; r < R; r++) { ss[r] += dot(xv[r], xv[r]); xv[r] *= nw; }" else "", if (norm) "{ const float v = simd_sum(ss[r]); if (lane == 0) ssr[int(sg) * R + r] = v; }" else "",
+        k,
+        wrow,
+        xv,
+        if (norm) "const float4 nw = LDW(NW, i); for (int r = 0; r < R; r++) { ss[r] += dot(xv[r], xv[r]); xv[r] *= nw; }" else "",
+        if (norm) "{ const float v = simd_sum(ss[r]); if (lane == 0) ssr[int(sg) * R + r] = v; }" else "",
     });
 }
-
-/// Epilogue helpers: column n's dot for row r, and 1/rms of row r.
-const SUMS =
-    \\#define rsum(n, r) rsum_(red, SG, NO, R, n, r)
-    \\#define rinv(r) rinv_(ssr, SG, R, r)
-    \\
-;
 
 // A: rmsnorm1 + qkv + rotary. Grid: 3072 / NO threadgroups.
 const SRC_QKV = PRELUDE ++
@@ -128,7 +138,7 @@ const SRC_QKV = PRELUDE ++
     \\const device bfloat16_t* W = which == 0 ? WQ : (which == 1 ? WK : WV);
     \\const device bfloat16_t* Bv = which == 0 ? BQ : (which == 1 ? BK : BV);
     \\
-++ gemv(1024, "W + col0 * 1024", "LDW(X, r * 1024 + i)", true) ++ SUMS ++
+++ gemv(1024, "W + (col0 + n) * 1024", "LDW(X, r * 1024 + i)", true) ++
     \\for (int ei = int(t); ei < NO / 2 * R; ei += 32 * SG) {
     \\    const int n = (ei / R) * 2, r = ei % R, col = col0 + n;
     \\    const float inv = rinv(r);
@@ -182,7 +192,7 @@ const SRC_ATTN = PRELUDE ++
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
-++ gemv(1024, "WO + ob * 1024", "bf4(*(threadgroup const uint2*)(xs + r * 1024 + i))", false) ++ SUMS ++
+++ gemv(1024, "WO + (ob + n) * 1024", "bf4(*(threadgroup const uint2*)(xs + r * 1024 + i))", false) ++
     \\for (int e = int(t); e < NO * R; e += 32 * SG) {
     \\    const int n = e / R, r = e % R, o = ob + n;
     \\    OUT[r * 1024 + o] = bfloat16_t(float(X[r * 1024 + o]) + rb(rsum(n, r) + float(BO[o])));
@@ -191,7 +201,7 @@ const SRC_ATTN = PRELUDE ++
 
 // C: rmsnorm2 + ff1 + mlx.nn.gelu_approx (each bf16 op rounded, constants in
 // bf16 like the Python weak scalars). Grid: 4096 / NO.
-const SRC_FF1 = PRELUDE ++ gemv(1024, "W1 + ob * 1024", "LDW(X, r * 1024 + i)", true) ++ SUMS ++
+const SRC_FF1 = PRELUDE ++ gemv(1024, "W1 + (ob + n) * 1024", "LDW(X, r * 1024 + i)", true) ++
     \\for (int e = int(t); e < NO * R; e += 32 * SG) {
     \\    const int n = e / R, r = e % R, o = ob + n;
     \\    const float x = rb(rsum(n, r) * rinv(r) + float(B1[o]));
@@ -203,7 +213,7 @@ const SRC_FF1 = PRELUDE ++ gemv(1024, "W1 + ob * 1024", "LDW(X, r * 1024 + i)", 
 ;
 
 // D: ff2 + residual. Grid: 1024 / NO.
-const SRC_FF2 = PRELUDE ++ gemv(4096, "W2 + ob * 4096", "LDW(HH, r * 4096 + i)", false) ++ SUMS ++
+const SRC_FF2 = PRELUDE ++ gemv(4096, "W2 + (ob + n) * 4096", "LDW(HH, r * 4096 + i)", false) ++
     \\for (int e = int(t); e < NO * R; e += 32 * SG) {
     \\    const int n = e / R, r = e % R, o = ob + n;
     \\    OUT[r * 1024 + o] = bfloat16_t(float(X[r * 1024 + o]) + rb(rsum(n, r) + float(B2[o])));
@@ -254,12 +264,123 @@ const SRC_FINAL =
     \\}
 ;
 
+// ── Qwen2 LM decode (one token, B = L = 1) ──
+// 896 wide, 14 query heads / 2 kv heads of 64, MLP 4864. Five dispatches per
+// layer (MLX: ~17): LA norm+qkv+rope, LB attention + cache append, LC o_proj +
+// residual, LD norm+gate/up+swiglu, LE down + residual.
+
+// LA: rmsnorm + q/k/v + bias + rope (MLX fast::rope, non-traditional: pairs
+// (d, d+32), inv_freq = exp2(-(d/32) * log2(theta)), fast::cos/sin in f32).
+// Output [q 896 | k 128 | v 128]. Threadgroups: q 896/NO, k 128/NO, v 128/NO;
+// q/k threadgroups own NO/2 rope pairs.
+const SRC_LM_QKV = PRELUDE ++
+    \\const int tg = int(threadgroup_position_in_grid.x), qtg = 896 / NO, ktg = 128 / NO;
+    \\const int which = tg < qtg ? 0 : (tg < qtg + ktg ? 1 : 2);
+    \\const int loc = tg - (which == 0 ? 0 : (which == 1 ? qtg : qtg + ktg));
+    \\const device bfloat16_t* W = which == 0 ? WQ : (which == 1 ? WK : WV);
+    \\const device bfloat16_t* Bv = which == 0 ? BQ : (which == 1 ? BK : BV);
+    \\#define COL(n) (which == 2 ? loc * NO + (n) : ((loc * (NO / 2) + (n) / 2) / 32) * 64 + (loc * (NO / 2) + (n) / 2) % 32 + 32 * ((n) % 2))
+    \\
+++ gemv(896, "W + COL(n) * 896", "LDW(X, i)", true) ++
+    \\for (int e = int(t); e < NO / 2; e += 32 * SG) {
+    \\    const int n = 2 * e, c1 = COL(n), c2 = COL(n + 1);
+    \\    const float inv = rinv(0);
+    \\    float x1 = rb(rsum(n, 0) * inv + float(Bv[c1]));
+    \\    float x2 = rb(rsum(n + 1, 0) * inv + float(Bv[c2]));
+    \\    if (which < 2) {
+    \\        const float th = float(POS) * metal::exp2(-(float(c1 % 64) / 32.0f) * as_type<float>(LOG2BASE));
+    \\        const float c = metal::fast::cos(th), sn = metal::fast::sin(th);
+    \\        const float r1 = x1 * c - x2 * sn, r2 = x1 * sn + x2 * c;
+    \\        x1 = r1; x2 = r2;
+    \\    }
+    \\    const int off = which == 0 ? 0 : (which == 1 ? 896 : 1024);
+    \\    OUT[off + c1] = bfloat16_t(x1);
+    \\    OUT[off + c2] = bfloat16_t(x2);
+    \\}
+;
+
+// LB: attention of the new token over the cache plus itself, and the cache
+// append (MLX: two concatenates + sdpa). One threadgroup of 256 per query
+// head; KC/VC [1, 2, Lc, 64] → KN/VN [1, 2, Lc + 1, 64], copied by all
+// threadgroups. Scores in f32, two-pass softmax (MLX: sdpa_vector's online
+// one), output rounded to bf16.
+const SRC_LM_ATTN =
+    \\const int t = int(thread_position_in_threadgroup.x), h = int(threadgroup_position_in_grid.x), kvh = h / 7;
+    \\const int Lc = KC_shape[2], N = Lc + 1;
+    \\threadgroup float q[64];
+    \\threadgroup float sc[512];
+    \\threadgroup float rd[256];
+    \\if (t < 64) q[t] = 0.125f * float(QKV[h * 64 + t]);
+    \\for (int idx = h * 256 + t; idx < 2 * N * 64; idx += 14 * 256) {
+    \\    const int row = idx / 64, d = idx % 64, kh = row / N, j = row % N;
+    \\    KN[idx] = j < Lc ? KC[(kh * Lc + j) * 64 + d] : QKV[896 + kh * 64 + d];
+    \\    VN[idx] = j < Lc ? VC[(kh * Lc + j) * 64 + d] : QKV[1024 + kh * 64 + d];
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float m = -INFINITY;
+    \\for (int j = t; j < N; j += 256) {
+    \\    const device bfloat16_t* kr = j < Lc ? KC + (kvh * Lc + j) * 64 : QKV + 896 + kvh * 64;
+    \\    float a = 0.0f;
+    \\    for (int d = 0; d < 64; d += 4) a += dot(LDW(kr, d), *(threadgroup const float4*)(q + d));
+    \\    sc[j] = a;
+    \\    m = max(m, a);
+    \\}
+    \\const int lane = t % 32, sgi = t / 32;
+    \\m = simd_max(m);
+    \\if (lane == 0) rd[sgi] = m;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\m = rd[0];
+    \\for (int g = 1; g < 8; g++) m = max(m, rd[g]);
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float sum = 0.0f;
+    \\for (int j = t; j < N; j += 256) { const float p = metal::exp(sc[j] - m); sc[j] = p; sum += p; }
+    \\sum = simd_sum(sum);
+    \\if (lane == 0) rd[sgi] = sum;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\sum = 0.0f;
+    \\for (int g = 0; g < 8; g++) sum += rd[g];
+    \\const int d = t % 64, grp = t / 64;
+    \\float acc = 0.0f;
+    \\for (int j = grp; j < N; j += 4)
+    \\    acc += sc[j] * float(j < Lc ? VC[(kvh * Lc + j) * 64 + d] : QKV[1024 + kvh * 64 + d]);
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\rd[t] = acc;
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (t < 64) OUT[h * 64 + t] = bfloat16_t((rd[t] + rd[t + 64] + rd[t + 128] + rd[t + 192]) / sum);
+;
+
+// LC: o_proj (no bias) + residual. Grid: 896 / NO.
+const SRC_LM_O = PRELUDE ++ gemv(896, "WO + (ob + n) * 896", "LDW(O, i)", false) ++
+    \\for (int n = int(t); n < NO; n += 32 * SG) OUT[ob + n] = bfloat16_t(float(X[ob + n]) + rb(rsum(n, 0)));
+;
+
+// LD: rmsnorm + gate/up (no bias) + swiglu: silu(g) * u with each bf16 op
+// rounded (sigmoid evaluated in f32, rounded once). NO = 2 * columns: rows
+// n < NO/2 are gate, the rest up. Grid: 4864 / (NO / 2).
+const SRC_LM_UP = PRELUDE ++
+    \\const int c0 = int(threadgroup_position_in_grid.x) * (NO / 2);
+    \\
+++ gemv(896, "(n < NO / 2 ? WG + (c0 + n) * 896 : WU + (c0 + n - NO / 2) * 896)", "LDW(X, i)", true) ++
+    \\for (int n = int(t); n < NO / 2; n += 32 * SG) {
+    \\    const float inv = rinv(0);
+    \\    const float g = rb(rsum(n, 0) * inv), u = rb(rsum(n + NO / 2, 0) * inv);
+    \\    const float sg_ = rb(1.0f / (1.0f + metal::exp(-g)));
+    \\    OUT[c0 + n] = bfloat16_t(rb(g * sg_) * u);
+    \\}
+;
+
+// LE: down (no bias) + residual. Grid: 896 / NO.
+const SRC_LM_DOWN = PRELUDE ++ gemv(4864, "WD + (ob + n) * 4864", "LDW(HH, i)", false) ++
+    \\for (int n = int(t); n < NO; n += 32 * SG) OUT[ob + n] = bfloat16_t(float(X[ob + n]) + rb(rsum(n, 0)));
+;
+
 const Kernel = struct {
     name: [*:0]const u8,
     ins: []const [*:0]const u8,
+    outs: []const [*:0]const u8 = &.{"OUT"},
     src: [:0]const u8,
-    tile: Tile = .{ .no = 8, .sg = 4, .vw = 4 },
-    env: ?[*:0]const u8 = null, // tuning override "no,sg,vw"
+    tile: Tile = .{ .no = 8, .sg = 4 },
+    env: ?[*:0]const u8 = null, // tuning override "no,sg"
     k: ?mlx.mlx_fast_metal_kernel = null,
 
     fn get(self: *Kernel) !mlx.mlx_fast_metal_kernel {
@@ -269,13 +390,11 @@ const Kernel = struct {
             self.tile = .{
                 .no = try std.fmt.parseInt(c_int, it.next() orelse "8", 10),
                 .sg = try std.fmt.parseInt(c_int, it.next() orelse "4", 10),
-                .vw = try std.fmt.parseInt(c_int, it.next() orelse "4", 10),
             };
         };
-        const outs = [_][*:0]const u8{"OUT"};
         const iv = mlx.mlx_vector_string_new_data(self.ins.ptr, self.ins.len);
         defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        const ov = mlx.mlx_vector_string_new_data(self.outs.ptr, self.outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
         const k = mlx.mlx_fast_metal_kernel_new(self.name, iv, ov, self.src.ptr, HEADER, true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
@@ -284,32 +403,36 @@ const Kernel = struct {
     }
 };
 
-var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4, .vw = 4 }, .env = "MING_FT_A" };
-var k_attn: Kernel = .{ .name = "ming_dit_attn_out", .ins = &.{ "QKV", "X", "WO", "BO" }, .src = SRC_ATTN, .tile = .{ .no = 8, .sg = 8, .vw = 4 }, .env = "MING_FT_B" };
-var k_ff1: Kernel = .{ .name = "ming_dit_ff1", .ins = &.{ "X", "NW", "W1", "B1" }, .src = SRC_FF1, .tile = .{ .no = 2, .sg = 4, .vw = 4 }, .env = "MING_FT_C" };
-var k_ff2: Kernel = .{ .name = "ming_dit_ff2", .ins = &.{ "HH", "X", "W2", "B2" }, .src = SRC_FF2, .tile = .{ .no = 2, .sg = 4, .vw = 4 }, .env = "MING_FT_D" };
+var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_A" };
+var k_attn: Kernel = .{ .name = "ming_dit_attn_out", .ins = &.{ "QKV", "X", "WO", "BO" }, .src = SRC_ATTN, .tile = .{ .no = 8, .sg = 8 }, .env = "MING_FT_B" };
+var k_ff1: Kernel = .{ .name = "ming_dit_ff1", .ins = &.{ "X", "NW", "W1", "B1" }, .src = SRC_FF1, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_C" };
+var k_ff2: Kernel = .{ .name = "ming_dit_ff2", .ins = &.{ "HH", "X", "W2", "B2" }, .src = SRC_FF2, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_D" };
 var k_embed: Kernel = .{ .name = "ming_cfm_embed", .ins = &.{ "Y", "WX", "BX", "TE", "CE", "XH" }, .src = SRC_EMBED };
+var k_lm_qkv: Kernel = .{ .name = "ming_lm_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "POS" }, .src = SRC_LM_QKV, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_LA" };
+var k_lm_attn: Kernel = .{ .name = "ming_lm_attn", .ins = &.{ "QKV", "KC", "VC" }, .outs = &.{ "OUT", "KN", "VN" }, .src = SRC_LM_ATTN };
+var k_lm_o: Kernel = .{ .name = "ming_lm_o", .ins = &.{ "O", "X", "WO" }, .src = SRC_LM_O, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_LC" };
+var k_lm_up: Kernel = .{ .name = "ming_lm_up", .ins = &.{ "X", "NW", "WG", "WU" }, .src = SRC_LM_UP, .tile = .{ .no = 4, .sg = 4 }, .env = "MING_FT_LD" };
+var k_lm_down: Kernel = .{ .name = "ming_lm_down", .ins = &.{ "HH", "X", "WD" }, .src = SRC_LM_DOWN, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_LE" };
 var k_final: Kernel = .{ .name = "ming_cfm_final", .ins = &.{ "X", "NW", "WF", "BF", "Y", "DTT", "SQ", "SDE" }, .src = SRC_FINAL };
 
 const Tmpl = struct { [*:0]const u8, c_int };
 
-/// Run one kernel → its single bf16 output (owned by the caller). With
+/// Run one kernel → its bf16 outputs (owned by the caller) in `outs`. With
 /// `n_cols`, a GEMV kernel: n_cols / tile.no threadgroups of tile.sg
-/// simdgroups; otherwise `n_cols_or_tgs` threadgroups of 128.
-fn run(kr: *Kernel, inputs: []const Arr, out_shape: []const c_int, n_cols: ?c_int, tgs: c_int, tmpl: []const Tmpl, s: S) !Arr {
+/// simdgroups; otherwise `tgs` threadgroups of `tg` threads.
+fn runN(kr: *Kernel, inputs: []const Arr, shapes: []const []const c_int, n_cols: ?c_int, tgs: c_int, tg_threads: c_int, tmpl: []const Tmpl, s: S, outs: []Arr) !void {
     const k = try kr.get();
     const c = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, out_shape.ptr, out_shape.len, .bfloat16));
+    for (shapes) |sh| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, sh.len, .bfloat16));
     var n_tg = tgs;
-    var tg: c_int = 128;
+    var tg = tg_threads;
     if (n_cols) |n| {
         const tl = kr.tile;
         n_tg = @divExact(n, tl.no);
         tg = 32 * tl.sg;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NO", tl.no));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "SG", tl.sg));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "VW", tl.vw));
     }
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, n_tg * tg, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, tg, 1, 1));
@@ -319,9 +442,16 @@ fn run(kr: *Kernel, inputs: []const Arr, out_shape: []const c_int, n_cols: ?c_in
     var o = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k, v, c, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&out, o, 0));
-    return out;
+    for (outs, 0..) |*out, i| {
+        out.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(out, o, i));
+    }
+}
+
+fn run(kr: *Kernel, inputs: []const Arr, out_shape: []const c_int, n_cols: ?c_int, tgs: c_int, tmpl: []const Tmpl, s: S) !Arr {
+    var out: [1]Arr = undefined;
+    try runN(kr, inputs, &.{out_shape}, n_cols, tgs, 128, tmpl, s, &out);
+    return out[0];
 }
 
 /// Weights of one DiT block, original [out, in] layout (contiguous).
@@ -344,7 +474,7 @@ pub const Block = struct {
 
 /// Whether x [B, L, 1024] fits the fused DiT kernels.
 pub fn eligible(x: Arr, s: S) bool {
-    if (!enabled() or !mlx.streamIsGpu(s)) return false;
+    if (!ditEnabled() or !mlx.streamIsGpu(s)) return false;
     const sh = mlx.getShape(x);
     return sh.len == 3 and sh[2] == D and sh[0] * sh[1] <= MAX_ROWS and mlx.mlx_array_dtype(x) == .bfloat16;
 }
@@ -396,4 +526,45 @@ pub fn final(h: Arr, nw: Arr, wf: Arr, bf: Arr, y: Arr, dtt: Arr, sq: Arr, sde: 
         .{ "CFG", @bitCast(cfg) },
         .{ "SHIFT", @bitCast(shift) },
     }, s);
+}
+
+/// Weights of one Qwen2 layer (q/k/v biased; o, gate, up, down not).
+pub const LmLayer = struct {
+    ln1: Arr,
+    ln2: Arr,
+    wq: Arr,
+    wk: Arr,
+    wv: Arr,
+    bq: Arr,
+    bk: Arr,
+    bv: Arr,
+    wo: Arr,
+    wg: Arr,
+    wu: Arr,
+    wd: Arr,
+};
+
+pub const LmOut = struct { qkv: Arr, o: Arr, x1: Arr, hh: Arr, x2: Arr, k: Arr, v: Arr };
+
+/// One Qwen2 decode layer on x [1, 1, 896] at position `pos` (the cache
+/// length) with cache kc/vc [1, 2, pos, 64]. Returns the layer output `x2`
+/// and the appended cache `k`/`v`; the rest are intermediates for the
+/// caller's scope. `log2_theta`: log2 of the rope base, as MLX passes it.
+pub fn lmLayer(l: *const LmLayer, x: Arr, pos: Arr, kc: Arr, vc: Arr, log2_theta: f32, s: S) !LmOut {
+    var r: LmOut = undefined;
+    const sh = mlx.getShape(x);
+    const n: c_int = mlx.getShape(kc)[2] + 1;
+    if (n > 512) return error.CacheTooLong;
+    const t1: []const Tmpl = &.{ .{ "R", 1 }, .{ "LOG2BASE", @bitCast(log2_theta) } };
+    const t: []const Tmpl = &.{.{ "R", 1 }};
+    r.qkv = try run(&k_lm_qkv, &.{ x, l.ln1, l.wq, l.wk, l.wv, l.bq, l.bk, l.bv, pos }, &.{1152}, 1152, 0, t1, s);
+    var three: [3]Arr = undefined;
+    try runN(&k_lm_attn, &.{ r.qkv, kc, vc }, &.{ sh, &.{ 1, 2, n, 64 }, &.{ 1, 2, n, 64 } }, null, 14, 256, &.{}, s, &three);
+    r.o = three[0];
+    r.k = three[1];
+    r.v = three[2];
+    r.x1 = try run(&k_lm_o, &.{ r.o, x, l.wo }, sh, 896, 0, t, s);
+    r.hh = try run(&k_lm_up, &.{ r.x1, l.ln2, l.wg, l.wu }, &.{4864}, 2 * 4864, 0, t, s);
+    r.x2 = try run(&k_lm_down, &.{ r.hh, r.x1, l.wd }, sh, 896, 0, t, s);
+    return r;
 }

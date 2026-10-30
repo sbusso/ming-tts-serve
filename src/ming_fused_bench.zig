@@ -41,6 +41,54 @@ pub fn main(init: std.process.Init) !void {
     defer it.deinit();
     _ = it.next();
     var dir = it.next() orelse return error.Usage;
+    if (std.mem.eql(u8, dir, "lmcheck")) {
+        // bf16 fused and bf16 MLX LM decode vs an f32 copy of the model.
+        dir = it.next() orelse return error.Usage;
+        mlx.installErrorHandler();
+        const s = mlx.mlx_default_gpu_stream_new();
+        const mb = try ming.Model.load(a, s, dir, .{});
+        defer mb.deinit();
+        const mf = try ming.Model.load(a, s, dir, .{ .cast_to = .float32 });
+        defer mf.deinit();
+        var g = ming.G.init(a, s);
+        defer g.deinit();
+        const pre = try g.normal(&.{ 1, 200, 896 }, .float32);
+        const e1 = try g.normal(&.{ 1, 1, 896 }, .float32);
+        const steps: usize = if (std.c.getenv("LMCHECK_STEPS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 8;
+        var outs: [3]Arr = undefined;
+        for (0..3) |k| {
+            const m = if (k == 2) mf else mb;
+            const dt: mlx.mlx_dtype = if (k == 2) .float32 else .bfloat16;
+            _ = setenv("MING_FUSED", if (k == 0) "1" else "0", 1);
+            var cache = try ming.KvCache.init(a, m.lm.layers.len);
+            defer cache.deinit();
+            try ming.evalAll(&.{try m.lmForward(&g, try g.astype(pre, dt), &cache)});
+            var x = try g.astype(e1, dt);
+            for (0..steps) |_| x = try m.lmForward(&g, x, &cache); // decode steps, fed back
+            outs[k] = try g.astype(x, .float32);
+            try ming.evalAll(&.{outs[k]});
+        }
+        for ([_][]const u8{ "fused bf16", "MLX bf16" }, 0..) |name, k| {
+            const dv = try ming.toF32(a, try g.abs(try g.sub(outs[k], outs[2])), s);
+            defer a.free(dv);
+            const rv = try ming.toF32(a, outs[2], s);
+            defer a.free(rv);
+            var mx: f32 = 0;
+            var at: usize = 0;
+            var sum: f64 = 0;
+            var big: usize = 0;
+            for (dv, 0..) |e, i| {
+                if (e > mx) {
+                    mx = e;
+                    at = i;
+                }
+                sum += e;
+                if (e > 0.05) big += 1;
+            }
+            std.debug.print("{s} vs f32 after {d} steps: max|d| {e:.3} at {d} (ref {d:.3}), mean|d| {e:.3}, >0.05: {d}\n", .{ name, steps, mx, at, rv[at], sum / @as(f64, @floatFromInt(dv.len)), big });
+        }
+        return;
+    }
     if (std.mem.eql(u8, dir, "spk")) {
         dir = it.next() orelse return error.Usage;
         const cp_path = try std.fmt.allocPrint(a, "{s}/campplus.safetensors", .{dir});
@@ -139,6 +187,81 @@ pub fn main(init: std.process.Init) !void {
     for (r) |e| rm = @max(rm, @abs(e));
     std.debug.print("cfm out max|fused-mlx| = {e:.3} (max|mlx| {e:.3})\n", .{ mx, rm });
 
+    // LM decode step (MLX graph) at a 256-position cache, and the aggregator.
+    {
+        var cache = try ming.KvCache.init(a, m.lm.layers.len);
+        defer cache.deinit();
+        {
+            var g = ming.G.init(a, s);
+            defer g.deinit();
+            const pre = try g.normal(&.{ 1, 256, 896 }, .bfloat16);
+            try ming.evalAll(&.{try m.lmForward(&g, pre, &cache)});
+        }
+        const e1 = try g0.normal(&.{ 1, 1, 896 }, .bfloat16);
+        const lat = try g0.normal(&.{ 1, 1, 64 }, .bfloat16);
+        try ming.evalAll(&.{ e1, lat });
+        // Fused vs MLX decode of one token on the same cache.
+        var dec: [2]Arr = undefined;
+        for ([_][*:0]const u8{ "1", "0" }, 0..) |flag, k| {
+            _ = setenv("MING_FUSED", flag, 1);
+            var g = ming.G.init(a, s);
+            defer g.deinit();
+            dec[k] = try ming.own(try m.lmForward(&g, e1, &cache));
+            try ming.evalAll(&.{dec[k]});
+            cache.len -= 1;
+            for (cache.k, cache.v) |*kk, *vv| {
+                const k2 = try g.sliceAxis(kk.*, 2, 0, cache.len, 1);
+                const v2 = try g.sliceAxis(vv.*, 2, 0, cache.len, 1);
+                _ = mlx.mlx_array_free(kk.*);
+                _ = mlx.mlx_array_free(vv.*);
+                kk.* = try ming.own(k2);
+                vv.* = try ming.own(v2);
+            }
+        }
+        {
+            const dd = try g0.abs(try g0.sub(try g0.astype(dec[0], .float32), try g0.astype(dec[1], .float32)));
+            const dv = try ming.toF32(a, dd, s);
+            defer a.free(dv);
+            const rv = try ming.toF32(a, dec[1], s);
+            defer a.free(rv);
+            var dmx: f32 = 0;
+            var drm: f32 = 0;
+            for (dv, rv) |e, rr| {
+                dmx = @max(dmx, e);
+                drm = @max(drm, @abs(rr));
+            }
+            std.debug.print("LM decode max|fused-mlx| = {e:.3} (max|mlx| {e:.3})\n", .{ dmx, drm });
+            for (dec) |dx| _ = mlx.mlx_array_free(dx);
+        }
+        for ([_][*:0]const u8{ "1", "0" }) |flag| for ([_][]const u8{ "LM decode", "aggregate" }, 0..) |name, wi| {
+            _ = setenv("MING_FUSED", flag, 1);
+            var best: f64 = 1e9;
+            var enc: f64 = 1e9;
+            for (0..20) |_| {
+                var g = ming.G.init(a, s);
+                defer g.deinit();
+                const t0 = now(io);
+                const y = if (wi == 0) try m.lmForward(&g, e1, &cache) else try m.aggregate(&g, lat);
+                try ming.asyncEvalAll(&.{y});
+                enc = @min(enc, ms(io, t0));
+                try ming.evalAll(&.{y});
+                best = @min(best, ms(io, t0));
+                if (wi == 0) { // drop the appended position again
+                    cache.len -= 1;
+                    for (cache.k, cache.v) |*kk, *vv| {
+                        const k2 = try g.sliceAxis(kk.*, 2, 0, cache.len, 1);
+                        const v2 = try g.sliceAxis(vv.*, 2, 0, cache.len, 1);
+                        _ = mlx.mlx_array_free(kk.*);
+                        _ = mlx.mlx_array_free(vv.*);
+                        kk.* = try ming.own(k2);
+                        vv.* = try ming.own(v2);
+                    }
+                }
+            }
+            std.debug.print("{s:<12} MING_FUSED={s} {d:.3} ms (encode {d:.3})\n", .{ name, flag, best, enc });
+        };
+        _ = setenv("MING_FUSED", "1", 1);
+    }
     // Per-kernel GPU time: N dispatches of one kernel on fixed inputs, one eval.
     _ = setenv("MING_FUSED", "1", 1);
     const b = &m.dit.fb[0];
@@ -178,7 +301,8 @@ pub fn main(init: std.process.Init) !void {
             defer g.deinit();
             var y = x;
             for (0..80) |yi| {
-                const bb = if (yi % 16 < 8) &m.dit.fb[yi % 8] else &m.agg.fb[yi % 8];
+                const hot = std.c.getenv("BENCH_HOT") != null;
+                const bb = if (hot) &m.dit.fb[0] else if (yi % 16 < 8) &m.dit.fb[yi % 8] else &m.agg.fb[yi % 8];
                 if (ki == 0) {
                     const o = try fused.block(bb, y, m.dit.rot.tab[0], m.dit.rot.tab[1], s);
                     for ([_]Arr{ o.qkv, o.x1, o.hh }) |q| _ = try g.keep(q);

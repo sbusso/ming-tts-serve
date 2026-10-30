@@ -211,7 +211,9 @@ pub fn main(init: std.process.Init) !void {
             const zi = try g.reshape(trace.z.items[i], &.{ 1, 896 });
             const zr = try g.sliceAxis(z_ref, 0, @intCast(i), @intCast(i + 1), 1);
             const d = try g.abs(try g.sub(try g.astype(zi, .float32), zr));
-            zmax = @max(zmax, try maxAbs(a, s, d));
+            const zd = try maxAbs(a, s, d);
+            if (std.c.getenv("MING_PARITY_STEPS") != null and i < 6) std.debug.print("  z step {d}: max|d|={e:.3}\n", .{ i, zd });
+            zmax = @max(zmax, zd);
         }
         const stop_ref = try ming.toF32(a, try ref.get("stop_prob", .{}), s);
         defer a.free(stop_ref);

@@ -423,6 +423,44 @@ const QStack = struct {
     theta: f32 = 1e6,
     /// Sliding-window size (VAE backbones); null = plain causal (the LM).
     window: ?c_int = null,
+    /// Fused decode kernels' view of the layers (the LM only).
+    fl: ?[]fused.LmLayer = null,
+
+    fn fuse(st: *QStack, a: std.mem.Allocator) !void {
+        const fl = try a.alloc(fused.LmLayer, st.layers.len);
+        for (st.layers, fl) |l, *f| f.* = .{
+            .ln1 = l.ln1,
+            .ln2 = l.ln2,
+            .wq = l.q.w,
+            .wk = l.k.w,
+            .wv = l.v.w,
+            .bq = l.q.b.?,
+            .bk = l.k.b.?,
+            .bv = l.v.b.?,
+            .wo = l.o.w,
+            .wg = l.gate.w,
+            .wu = l.up.w,
+            .wd = l.down.w,
+        };
+        st.fl = fl;
+    }
+
+    /// One-token decode on the fused kernels (5 dispatches per layer).
+    fn decodeFused(st: *const QStack, g: *G, x_in: Arr, c: *KvCache) !Arr {
+        const pos = try g.keep(mlx.mlx_array_new_int(c.len));
+        var x = x_in;
+        for (st.fl.?, 0..) |*l, li| {
+            const o = try fused.lmLayer(l, x, pos, c.k[li], c.v[li], @log2(st.theta), g.s);
+            for ([_]Arr{ o.qkv, o.o, o.x1, o.hh, o.x2 }) |y| _ = try g.keep(y);
+            _ = mlx.mlx_array_free(c.k[li]);
+            _ = mlx.mlx_array_free(c.v[li]);
+            c.k[li] = o.k;
+            c.v[li] = o.v;
+            x = o.x2;
+        }
+        c.len += 1;
+        return g.rms(x, st.norm, st.eps);
+    }
 
     fn load(t: *Tensors, a: std.mem.Allocator, s: S, comptime prefix: []const u8, n: usize, window: ?c_int) !QStack {
         const layers = try a.alloc(QLayer, n);
@@ -449,6 +487,11 @@ const QStack = struct {
         const B = sh[0];
         const L = sh[1];
         const offset: c_int = if (cache) |c| c.len else 0;
+        if (cache) |c| if (st.fl != null and B == 1 and L == 1 and offset > 0 and offset < MAX_CACHE_LEN and
+            fused.lmEnabled() and mlx.streamIsGpu(g.s) and mlx.mlx_array_dtype(x_in) == .bfloat16 and
+            mlx.mlx_array_dtype(st.layers[0].q.w) == .bfloat16 and st.heads == 14 and st.kv_heads == 2 and
+            mlx.getShape(x_in)[2] == HIDDEN)
+            return st.decodeFused(g, x_in, c);
         // Sliding mask (min(causal, window) additive, in the activation dtype),
         // or SDPA's causal mode for a multi-token LM prefill.
         var mask: Arr = .{ .ctx = null };
@@ -808,6 +851,7 @@ pub const Model = struct {
         const t = &m.t;
         m.embed = try t.get("model.model.embed_tokens.weight", .{});
         m.lm = try QStack.load(t, a, s, "model.model", 24, null);
+        try m.lm.fuse(a);
         m.stop_head = try t.lin(s, "stop_head", .{});
         m.spk_head = try t.lin(s, "spk_head", .{});
         const F = "flowloss.cfm.model";
@@ -879,6 +923,7 @@ pub const Model = struct {
         if (m.cfm_compiled) |c| _ = mlx.mlx_closure_free(c);
         if (m.agg_compiled) |c| _ = mlx.mlx_closure_free(c);
         for ([_][]QLayer{ m.lm.layers, m.enc.layers, m.enc_agg.layers, m.dec.layers }) |ls| a.free(ls);
+        if (m.lm.fl) |fl| a.free(fl);
         a.free(m.dit.blocks);
         a.free(m.agg.blocks);
         a.free(m.dit.fb);
@@ -1030,7 +1075,7 @@ pub const Model = struct {
     pub fn cfmSampleRaw(m: *Model, g: *G, z: Arr, hist: Arr, noise: Arr, sde: Arr, cfg: f32, sigma: f32, temperature: f32) !Arr {
         const dt = mlx.mlx_array_dtype(noise);
         const shift_k = sigma * std.math.sqrt(temperature);
-        if (fused.enabled() and mlx.streamIsGpu(g.s) and dt == .bfloat16 and dt == m.t_emb_dt and mlx.mlx_array_dtype(z) == .bfloat16)
+        if (fused.ditEnabled() and mlx.streamIsGpu(g.s) and dt == .bfloat16 and dt == m.t_emb_dt and mlx.mlx_array_dtype(z) == .bfloat16)
             return m.cfmSampleFused(g, z, hist, noise, sde, cfg, shift_k);
         const t = try flowSchedule(g, dt);
         var y = noise;
