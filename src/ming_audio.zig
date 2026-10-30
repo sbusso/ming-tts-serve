@@ -173,6 +173,61 @@ fn fft(re: *[NFFT]f64, im: *[NFFT]f64) void {
     }
 }
 
+/// Target level for reference audio: the speech RMS of the upstream voice
+/// presets (db30.wav -21.5, lingguang.wav -23.8 dBFS).
+pub const PROMPT_SPEECH_RMS_DB: f32 = -22.0;
+const PROMPT_PEAK_MAX: f32 = 0.89; // -1 dBFS
+
+/// Scale reference audio in place so its speech RMS is PROMPT_SPEECH_RMS_DB,
+/// with the peak capped at -1 dBFS. The model reproduces the reference's
+/// level, so a quiet take (e.g. peak -23, RMS -42 dBFS) otherwise yields
+/// equally quiet output. Speech RMS: 20 ms frames within 30 dB of the
+/// loudest frame. Departs from upstream, which uses the reference as is.
+/// Returns the gain applied.
+pub fn normalizePrompt(x: []f32, sample_rate: u32) f32 {
+    const n: usize = @max(1, sample_rate / 50);
+    if (x.len < n) return 1;
+    var max_ms: f64 = 0;
+    var i: usize = 0;
+    while (i + n <= x.len) : (i += n) max_ms = @max(max_ms, meanSquare(x[i..][0..n]));
+    if (max_ms <= 1e-12) return 1;
+    const floor = max_ms * 1e-3; // -30 dB in power
+    var sum: f64 = 0;
+    var count: usize = 0;
+    i = 0;
+    while (i + n <= x.len) : (i += n) {
+        const ms = meanSquare(x[i..][0..n]);
+        if (ms >= floor) {
+            sum += ms;
+            count += 1;
+        }
+    }
+    const rms: f32 = @floatCast(@sqrt(sum / @as(f64, @floatFromInt(count))));
+    var peak: f32 = 0;
+    for (x) |v| peak = @max(peak, @abs(v));
+    const gain = @min(std.math.pow(f32, 10, PROMPT_SPEECH_RMS_DB / 20) / rms, PROMPT_PEAK_MAX / peak);
+    for (x) |*v| v.* *= gain;
+    return gain;
+}
+
+fn meanSquare(x: []const f32) f64 {
+    var s: f64 = 0;
+    for (x) |v| s += @as(f64, v) * v;
+    return s / @as(f64, @floatFromInt(x.len));
+}
+
+/// Soft knee above 0.9: |x| > 0.9 maps to 0.9 + 0.1·tanh((|x| - 0.9) / 0.1),
+/// so output never reaches full scale and peaks round off instead of
+/// clipping. Plain TTS (no reference) often peaks above 1.0, which the 16-bit
+/// WAV would otherwise hard-clip. Per sample, so streamed chunks match the
+/// full output. Departs from upstream, which writes the samples as is.
+pub fn softLimit(x: []f32) void {
+    for (x) |*v| {
+        const m = @abs(v.*);
+        if (m > 0.9) v.* = std.math.copysign(0.9 + 0.1 * std.math.tanh((m - 0.9) / 0.1), v.*);
+    }
+}
+
 /// Vendor `ming_tts.trim_trailing_silence`: cut after the last 100 ms frame
 /// whose mean |x| exceeds 1e-3, keeping 300 ms of tail. Returns a sub-slice.
 pub fn trimTrailingSilence(x: []const f32, sample_rate: u32) []const f32 {
@@ -202,6 +257,17 @@ test "resample keeps a DC level and the torchaudio output length" {
     defer a.free(y);
     try std.testing.expectEqual(@as(usize, 1600), y.len);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), y[800], 1e-3);
+}
+
+test "normalizePrompt lifts a quiet clip to the target speech level" {
+    var x: [16000]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = 0.01 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
+    const gain = normalizePrompt(&x, 16000);
+    try std.testing.expect(gain > 1);
+    var s: f64 = 0;
+    for (x) |v| s += @as(f64, v) * v;
+    const db = 10 * std.math.log10(s / x.len);
+    try std.testing.expectApproxEqAbs(@as(f64, PROMPT_SPEECH_RMS_DB), db, 0.1);
 }
 
 test "trim keeps 300 ms after the last loud frame" {

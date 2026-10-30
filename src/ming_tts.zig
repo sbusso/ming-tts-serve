@@ -13,6 +13,11 @@
 //!
 //! `error.BadRequest` carries the upstream message in `diag.msg()`. An Engine
 //! is not thread-safe: call it from one thread (MLX work must stay on it).
+//!
+//! Streaming: set `eng.on_chunk` to receive each text fragment's audio as
+//! soon as it is generated (the returned buffer still holds all of it).
+//! Long text is split into fragments of about 24 spoken units, so the first
+//! chunk arrives after the first sentence or clause instead of the whole text.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -47,7 +52,25 @@ pub const GenerateRequest = struct {
     seed: ?u64 = 0,
 };
 
+/// Receives audio as it is generated: mono f32 at SAMPLE_RATE, clamped to
+/// [-1, 1], valid only during the call. Called on the engine's thread.
+pub const Sink = struct {
+    ctx: ?*anyopaque,
+    f: *const fn (ctx: ?*anyopaque, samples: []const f32) void,
+};
+
 pub const Engine = struct {
+    /// Optional streaming callback for `synthesize` (and everything that calls it).
+    on_chunk: ?Sink = null,
+    /// Bring reference audio to the presets' speech level before use
+    /// (`audio.normalizePrompt`). Off reproduces upstream exactly.
+    normalize_prompt: bool = true,
+    /// Soft-limit output above 0.9 instead of hard clipping at 1.0
+    /// (`audio.softLimit`). Off reproduces upstream exactly.
+    soft_limit: bool = true,
+    /// Regenerate fragments with an implausible speaking rate
+    /// (`generateGuarded`). Off reproduces upstream exactly.
+    guard: bool = true,
     a: std.mem.Allocator,
     io: std.Io,
     s: model.S,
@@ -141,17 +164,28 @@ pub const Engine = struct {
             spk = try a.alloc(f32, model.SPK_DIM);
             @memset(spk.?, 0);
         } else if (req.prompt_wav_path) |p| {
+            const prof = std.c.getenv("MING_PROFILE") != null;
+            var t = std.Io.Timestamp.now(e.io, .awake);
             const loaded = try audio.loadMono(e.io, a, p);
             defer a.free(loaded.pcm);
             if (loaded.pcm.len == 0) return error.EmptyPrompt;
+            if (e.normalize_prompt) {
+                const gain = audio.normalizePrompt(loaded.pcm, loaded.sample_rate);
+                if (prof) std.debug.print("[ming] prompt gain {d:.1} dB\n", .{20 * std.math.log10(gain)});
+            }
+            if (prof) lap(e.io, &t, "prompt load");
             if (req.use_spk_emb) {
                 const w16 = try audio.resample(a, loaded.pcm, loaded.sample_rate, 16000);
                 defer a.free(w16);
+                if (prof) lap(e.io, &t, "resample 16k");
                 spk = try e.speaker.embed(a, w16);
+                if (prof) lap(e.io, &t, "CAM++");
             }
             const w44 = try audio.resample(a, loaded.pcm, loaded.sample_rate, SAMPLE_RATE);
             defer a.free(w44);
+            if (prof) lap(e.io, &t, "resample 44.1k");
             prompt_latent = try e.encodePromptLatent(w44, .rng);
+            if (prof) lap(e.io, &t, "VAE encode");
         }
         var prompt_text: ?[]const u8 = if (prompt_latent != null) req.prompt_text else null;
         if (prompt_text == null) if (prompt_latent) |x| {
@@ -171,9 +205,22 @@ pub const Engine = struct {
         var reused_text: ?[]u8 = null;
         defer if (reused_text) |x| a.free(x);
         for (frags.items, 0..) |frag, i| {
-            const chunk = try e.generateFragment(req, frag, spk, prompt_latent, prompt_text, zero);
+            const chunk = try e.generateGuarded(req, frag, spk, prompt_latent, prompt_text, zero);
             defer a.free(chunk);
             const trimmed = audio.trimTrailingSilence(chunk, SAMPLE_RATE);
+            if (e.soft_limit) audio.softLimit(chunk[0..trimmed.len]);
+            if (e.on_chunk) |sink| {
+                const clamped = try a.dupe(f32, trimmed);
+                defer a.free(clamped);
+                for (clamped) |*x| x.* = std.math.clamp(x.*, -1.0, 1.0);
+                sink.f(sink.ctx, clamped);
+            }
+            if (std.c.getenv("MING_PROFILE") != null) {
+                const units = text.spokenUnits(frag);
+                const secs = @as(f64, @floatFromInt(trimmed.len)) / SAMPLE_RATE;
+                const steps = chunk.len / model.PAD_ALIGN;
+                std.debug.print("[ming] frag {d}: {d} units, {d}/{d} steps, {d:.2}s, {d:.2} units/s: {s}\n", .{ i, units, steps, model.BASE_STEPS + model.STEPS_PER_UNIT * units, secs, @as(f64, @floatFromInt(units)) / secs, frag });
+            }
             try out.appendSlice(a, trimmed);
             if (reuse_first and i == 0) {
                 // VOICE_DESIGN/FREEFORM: later fragments clone the first one's voice.
@@ -191,6 +238,48 @@ pub const Engine = struct {
             }
         }
         return out.toOwnedSlice(a);
+    }
+
+    /// `generateFragment` with a check for failed generations: a fragment
+    /// whose speaking rate is implausible (`plausible`) is generated again
+    /// with fresh noise, and then once more without the reference latents
+    /// (speaker embedding only). The most plausible attempt is returned.
+    /// Long, noisy references (e.g. a 17 s room recording) can make the model
+    /// run to the step cap or stop after one word for most seeds, while the
+    /// same reference used as speaker embedding only is fine. Departs from
+    /// upstream (`guard` off reproduces it).
+    fn generateGuarded(e: *Engine, req: text.Request, frag: []const u8, spk: ?[]const f32, prompt_latent: ?Arr, prompt_text: ?[]const u8, zero: bool) ![]f32 {
+        const a = e.a;
+        var best = try e.generateFragment(req, frag, spk, prompt_latent, prompt_text, zero);
+        if (!e.guard) return best;
+        const units = text.spokenUnits(frag);
+        var best_score = plausibility(units, best.len);
+        var attempt: usize = 1;
+        while (best_score > 0 and attempt < 3) : (attempt += 1) {
+            const drop_latent = attempt == 2 and prompt_text != null and spk != null;
+            if (attempt == 2 and !drop_latent and prompt_text != null) break;
+            if (std.c.getenv("MING_PROFILE") != null) std.debug.print("[ming] fragment rate implausible ({d} units in {d:.2}s); retry {d}{s}\n", .{ units, @as(f64, @floatFromInt(best.len)) / SAMPLE_RATE, attempt, if (drop_latent) " without reference latents" else "" });
+            const next = try e.generateFragment(req, frag, spk, if (drop_latent) null else prompt_latent, if (drop_latent) null else prompt_text, zero);
+            const sc = plausibility(units, next.len);
+            if (sc < best_score) {
+                a.free(best);
+                best = next;
+                best_score = sc;
+            } else a.free(next);
+        }
+        return best;
+    }
+
+    /// 0 when `samples` of audio is a plausible length for `units` spoken
+    /// units (1.2 to 12 units/s; fragments under 4 units always pass), else
+    /// how far outside that range the rate is (log ratio).
+    fn plausibility(units: usize, samples: usize) f64 {
+        if (units < 4) return 0;
+        const secs = @max(@as(f64, @floatFromInt(samples)) / SAMPLE_RATE, 1e-3);
+        const rate = @as(f64, @floatFromInt(units)) / secs;
+        if (rate < 1.2) return @log(1.2 / rate);
+        if (rate > 12) return @log(rate / 12);
+        return 0;
     }
 
     /// core.generate: one fragment → untrimmed waveform (owned).
@@ -276,6 +365,11 @@ pub const RequestView = struct {
 };
 
 /// Front-pad to a multiple of 3528 samples (hop × VAE patch), owned.
+fn lap(io: std.Io, t: *std.Io.Timestamp, what: []const u8) void {
+    std.debug.print("[ming] {s}: {d:.1} ms\n", .{ what, @as(f64, @floatFromInt(t.untilNow(io, .awake).nanoseconds)) / 1e6 });
+    t.* = std.Io.Timestamp.now(io, .awake);
+}
+
 pub fn padPrompt(a: std.mem.Allocator, w: []const f32) ![]f32 {
     const r = w.len % model.PAD_ALIGN;
     const pad = if (r == 0) 0 else model.PAD_ALIGN - r;

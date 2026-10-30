@@ -1145,6 +1145,7 @@ pub fn sampleLatents(m: *Model, embeds_in: Arr, prompt_latent: ?Arr, p: SamplePa
     if (L >= MAX_CACHE_LEN) return error.PromptTooLong;
     const budget = MAX_CACHE_LEN - L; // patch_size 1
     const steps = @min(p.max_steps, budget);
+    if (std.c.getenv("MING_PROFILE") != null) std.debug.print("[ming] prefix {d} positions, step budget {d} (cap {d})\n", .{ L, budget, p.max_steps });
     var cache = try KvCache.init(a, m.lm.layers.len);
     defer cache.deinit();
     var latents: std.ArrayList(Arr) = .empty;

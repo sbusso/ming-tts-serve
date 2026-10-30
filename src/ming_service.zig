@@ -66,8 +66,15 @@ pub const Service = struct {
     /// Route one API request. Returns the JSON response body (allocated in
     /// `a`) and sets `status` to the HTTP status code.
     pub fn handle(self: *Service, a: Allocator, method: []const u8, path: []const u8, body: []const u8, status: *u16) ![]u8 {
+        return self.handleStream(a, method, path, body, status, null);
+    }
+
+    /// `handle`, plus streaming for /tts, /clone and /generate: `sink` gets
+    /// each text fragment's audio on the engine thread as soon as it is
+    /// generated, before the response (and WAV) for the whole text is ready.
+    pub fn handleStream(self: *Service, a: Allocator, method: []const u8, path: []const u8, body: []const u8, status: *u16, sink: ?ming.Sink) ![]u8 {
         status.* = 200;
-        return route(self, a, method, path, body, status);
+        return route(self, a, method, path, body, status, sink);
     }
 };
 
@@ -118,6 +125,7 @@ const Job = struct {
     elapsed_s: f64 = 0,
     err: ?ApiError = null,
     done: bool = false,
+    sink: ?ming.Sink = null,
 };
 
 fn worker(st: *State) void {
@@ -130,6 +138,10 @@ fn worker(st: *State) void {
         return;
     };
     defer eng.deinit();
+    // A/B switches for the two deliberate departures from upstream.
+    if (std.c.getenv("MING_PROMPT_NORM")) |v| eng.normalize_prompt = !std.mem.eql(u8, std.mem.span(v), "0");
+    if (std.c.getenv("MING_SOFT_LIMIT")) |v| eng.soft_limit = !std.mem.eql(u8, std.mem.span(v), "0");
+    if (std.c.getenv("MING_GUARD")) |v| eng.guard = !std.mem.eql(u8, std.mem.span(v), "0");
     // Compile Metal kernels once so the first request is not slow.
     var d: ming.Diag = .{};
     if (eng.tts("Warm up.", "UK_George", null, 0, &d)) |w| {
@@ -173,6 +185,8 @@ fn runJob(eng: *ming.Engine, job: *Job) void {
     var d: ming.Diag = .{};
     const t0 = std.Io.Timestamp.now(eng.io, .awake);
     const r = job.req;
+    eng.on_chunk = job.sink;
+    defer eng.on_chunk = null;
     const res = switch (job.kind) {
         .tts => eng.tts(r.text, r.voice, r.instruction, r.seed, &d),
         .clone => eng.clone(r.text, r.prompt_wav_path.?, r.prompt_text, r.seed, &d),
@@ -212,7 +226,7 @@ fn errJson(a: Allocator, status: *u16, code: u16, msg: []const u8) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
-fn route(st: *State, a: Allocator, method: []const u8, path: []const u8, body: []const u8, status: *u16) ![]u8 {
+fn route(st: *State, a: Allocator, method: []const u8, path: []const u8, body: []const u8, status: *u16, sink: ?ming.Sink) ![]u8 {
     const get = std.mem.eql(u8, method, "GET");
     const post = std.mem.eql(u8, method, "POST");
     if (std.mem.eql(u8, path, "/health")) {
@@ -293,7 +307,7 @@ fn route(st: *State, a: Allocator, method: []const u8, path: []const u8, body: [
 
     const job = try st.a.create(Job);
     defer st.a.destroy(job);
-    job.* = .{ .kind = .generate, .arena = std.heap.ArenaAllocator.init(st.a) };
+    job.* = .{ .kind = .generate, .arena = std.heap.ArenaAllocator.init(st.a), .sink = sink };
     defer job.arena.deinit();
     const seed = seedOf(o, &perr, a);
     if (std.mem.eql(u8, path, "/tts")) {

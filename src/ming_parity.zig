@@ -95,6 +95,10 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("mode={s} tol={e}\n", .{ mode, tol });
 
     var eng = try engine.Engine.init(init.io, a, s, model_dir, .{ .cast_to = if (f32_mode) .float32 else null });
+    // Parity is against upstream, which neither normalizes the reference nor limits the output.
+    eng.normalize_prompt = false;
+    eng.soft_limit = false;
+    eng.guard = false;
     defer eng.deinit();
     const m = eng.model;
 
