@@ -292,6 +292,8 @@ Measured on an Apple M5 Max (128 GB, macOS 27.0.1), bf16 weights, one request at
 | ming-tts-serve, plain MLX graph (`MING_FUSED=0`) | 0.133 | 0.137 | 0.144 | about 14× |
 | **ming-tts-serve, fused kernels (default)** | **0.104** | **0.106** | **0.112** | **about 18×** |
 
+Speed depends mostly on memory bandwidth: each decode step reads about 3.1 GB of weights. On an Apple M4 Pro (48 GB, 273 GB/s), ming-tts-serve measured 0.199 (English), 0.210 (Chinese) and 0.217 (clone) with the fused kernels, and 0.236, 0.243 and 0.254 with `MING_FUSED=0`. The fused kernels are tuned on an M5 Max but help on M4 too.
+
 The mlx-audio row uses its own Ming-3.0 pipeline with two changes that make it do the same work as the other engines: the upstream VAE posterior formula for the clone prompt (mlx-audio 0.6.3 uses a different one), and a CAM++ speaker embedding for the clone. [bench/README.md](bench/README.md) describes both.
 
 What makes the difference:
