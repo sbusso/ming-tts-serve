@@ -1,19 +1,18 @@
-MLX 0.32.3 (and the Linux fork mlx-omarchy, 0.32.3 + Omarchy patches) inserted a
-`const std::optional<array>& global_scale` parameter into gather_qmm before
-`sorted_indices`; the pinned mlx-c @56b2d39 predates that and passes
-`sorted_indices` (bool) in its place, which fails to compile. Every other
-extended signature this mlx-c revision already matches the fork (quantize,
-dequantize, qqmm all carry global_scale here). Shim: pass no global scale —
-the C ABI has no surface for it yet.
+MLX 0.32.3 inserted a `const std::optional<array>& global_scale` parameter
+into gather_qmm before `sorted_indices`. mlx-c v0.7.0 (written for MLX 0.32.2)
+passes `sorted_indices` (bool) in its place, which fails to compile against
+0.32.3. mlx-c v0.8.0 adds the parameter but also binds mlx::core::unique,
+which only exists from MLX 0.32.4, so it does not build against 0.32.3.
+Shim: pass no global scale; ming-tts does not use it. Drop this patch when moving to MLX >= 0.32.4 + mlx-c v0.8.0.
 
 --- a/mlx/c/ops.cpp
 +++ b/mlx/c/ops.cpp
-@@ -1501,5 +1501,7 @@
+@@ -1708,6 +1708,8 @@ extern "C" int mlx_gather_qmm(
              (bits.has_value ? std::make_optional<int>(bits.value)
                              : std::nullopt),
              std::string(mode),
--            sorted_indices,
 +            /* global_scale: no C ABI surface yet */
 +            std::nullopt,
-+            sorted_indices,
+             sorted_indices,
              mlx_stream_get_(s)));
+   } catch (std::exception& e) {

@@ -162,7 +162,6 @@ pub extern "c" fn mlx_closure_new_func_payload(
 pub extern "c" fn mlx_closure_free(cls: mlx_closure) c_int;
 pub extern "c" fn mlx_closure_apply(res: *mlx_vector_array, cls: mlx_closure, input: mlx_vector_array) c_int;
 pub extern "c" fn mlx_compile(res: *mlx_closure, fun: mlx_closure, shapeless: bool) c_int;
-pub extern "c" fn mlx_detail_compile_clear_cache() c_int;
 
 // Map string -> array
 pub extern "c" fn mlx_map_string_to_array_new() mlx_map_string_to_array;
