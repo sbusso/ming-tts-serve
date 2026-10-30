@@ -216,6 +216,16 @@ const json = try svc.handle(arena, "POST", "/generate", body, &status);
 
 `Service.handle` takes the same JSON as the HTTP server and returns the same JSON. `Service.handleStream` also passes each text fragment's audio to a callback as soon as it is generated. For a typed API without JSON, use `ming.engine` (`src/ming_tts.zig`). All MLX work runs on one engine thread, so `handle` can be called from any thread.
 
+## Audio samples
+
+These clips were generated with `ming-tts say` and encoded to AAC. GitHub serves `.m4a` files as downloads, so they open in your audio player rather than in the browser.
+
+- [English, built-in voice `UK_George`](docs/samples/en-uk-george.m4a) (8.8 s)
+- [Chinese, built-in voice `灵小柔`](docs/samples/zh-ling-xiaorou.m4a) (6.0 s)
+- [French, `MULTILINGUAL` with language `fr`, cloned from upstream's `lingguang.wav` Mandarin voice preset](docs/samples/fr-lingguang.m4a) (5.0 s)
+
+`docs/samples/make.sh` regenerates them.
+
 ## Engine comparison
 
 The same three requests on each engine: an English sentence and a Chinese sentence with a built-in voice, and a voice clone from a 4-second reference clip. Each request runs 3 times with seeds 0–2 after a warm-up; the table shows the median real-time factor (RTF), which is generation time divided by audio duration. Lower is faster: 0.1 means 10 seconds of audio in 1 second.
@@ -224,27 +234,29 @@ Measured on an Apple M5 Max (128 GB, macOS 27.0.1), bf16 weights, one request at
 
 | Engine | TTS, English | TTS, Chinese | Voice clone | Speed vs. official |
 | --- | --- | --- | --- | --- |
-| Official [Ming-3.0-tts](https://github.com/inclusionAI/Ming-3.0-tts) code, PyTorch 2.6.0 on MPS | 1.842 | 1.936 | 1.949 | 1× |
-| [mlx-audio](https://github.com/Blaizzy/mlx-audio) 0.6.3, Python, MLX 0.32.4 | 0.199 | 0.207 | 0.208 | about 9× |
-| ming-tts-serve, plain MLX graph (`MING_FUSED=0`) | 0.141 | 0.152 | 0.151 | about 13× |
-| **ming-tts-serve, fused kernels (default)** | **0.108** | **0.111** | **0.117** | **about 17×** |
+| Official [Ming-3.0-tts](https://github.com/inclusionAI/Ming-3.0-tts) code, PyTorch 2.6.0 on MPS | 1.841 | 1.907 | 1.951 | 1× |
+| [mlx-audio](https://github.com/Blaizzy/mlx-audio) 0.6.3, Python, MLX 0.32.4 | 0.231 | 0.236 | 0.208 | about 8× |
+| ming-tts-serve, plain MLX graph (`MING_FUSED=0`) | 0.133 | 0.137 | 0.144 | about 14× |
+| **ming-tts-serve, fused kernels (default)** | **0.104** | **0.106** | **0.112** | **about 18×** |
+
+The mlx-audio row uses its own Ming-3.0 pipeline with two changes that make it do the same work as the other engines: the upstream VAE posterior formula for the clone prompt (mlx-audio 0.6.3 uses a different one), and a CAM++ speaker embedding for the clone. [bench/README.md](bench/README.md) describes both.
 
 What makes the difference:
 
 - **mlx-audio vs. PyTorch:** the same Python pipeline on MLX instead of PyTorch's MPS backend.
 - **Plain MLX graph vs. mlx-audio:** no Python, the whole flow-matching sampler compiled as one graph, the next decode step queued while the GPU runs the current one, and fixed tables (rotary, timestep embeddings) computed once at load. The output matches the Python MLX engine (see [Check parity](#check-parity)).
-- **Fused kernels vs. plain MLX graph:** custom Metal kernels run each DiT block as 4 GPU dispatches instead of about 15 and read each weight once per Euler step. This cuts the flow head from about 2,350 to about 340 dispatches per decode step. Speech quality is unchanged: word error rate and speaker similarity match the plain graph on 19 test cases × 3 seeds (see `MING_FUSED` in [Environment switches](#environment-switches)).
+- **Fused kernels vs. plain MLX graph:** custom Metal kernels run each DiT block as 4 GPU dispatches instead of about 15 and read each weight once per Euler step. This cuts the flow head from about 2,350 to about 340 dispatches per decode step. The fused kernels are not bit-exact, so the same seed gives a slightly different clip. On 4 cases (English, Chinese, French and a voice clone) × 5 seeds, the Whisper word or character error rate is 0.018 for the plain graph and 0.013 for the fused kernels, and the CAM++ speaker similarity to the reference clip is 0.733 and 0.741. The differences are within seed-to-seed variation. See [bench/README.md](bench/README.md#quality-check).
 
 Other differences that matter in practice:
 
 | | Official code | mlx-audio | ming-tts-serve |
 | --- | --- | --- | --- |
-| Time to first audio | full request | full request | about 0.7 s (streams each text fragment) |
+| Time to first audio | full request | first text fragment, with `stream=True` | about 0.7 s (streams each text fragment) |
 | Runtime | Python, PyTorch | Python, MLX | one native binary, no Python |
 | Tasks | all | all | all |
 | French numbers and typography | digits left to the model | digits left to the model | spelled out in French (`MING_FR_TN`) |
 
-The PyTorch and mlx-audio numbers come from the harnesses in the companion app repository (`server/` and `engine-mlx/bench.py`). The ming-tts-serve numbers come from `ming-tts bench --runs 3 --ref-wav lingguang.wav`.
+To reproduce the table, see [bench/README.md](bench/README.md). It runs the PyTorch and mlx-audio harnesses in `bench/` and `ming-tts bench --runs 3 --ref-wav lingguang.wav` with `MING_FUSED=0` and `1`.
 
 ## Check parity
 
