@@ -311,13 +311,13 @@ To reproduce the table, see [bench/README.md](bench/README.md). It runs the PyTo
 
 ## Check parity
 
-`ming-parity` compares each stage of the pipeline (text frontend, LM, DiT, CFM, aggregator, VAE, CAM++) with tensors dumped from the Python MLX engine. It always runs the plain MLX graph. The voice-clone case needs the reference clip the dumps were made with, upstream Ming's `data/voice_presets/voice_audio/lingguang.wav`:
+`ming-parity` is a development tool. It compares each stage of the pipeline (text frontend, LM, DiT, CFM, aggregator, VAE, CAM++) with tensors dumped from a Python MLX reference run, and always runs the plain MLX graph. The dumps are not part of this repository, so most users do not need it.
 
 ```sh
 zig-out/bin/ming-parity models/Ming-3.0-tts-0.5b <dump-dir> bf16 lingguang.wav
 ```
 
-The last argument can be replaced with `MING_REF_WAV`. Use `f32` instead of `bf16` for a CPU run that must agree to rounding.
+The last argument is the reference clip the dumps were made with (upstream Ming's `data/voice_presets/voice_audio/lingguang.wav`); `MING_REF_WAV` can replace it. Use `f32` instead of `bf16` for a CPU run that must agree to rounding.
 
 ## Make a release
 
