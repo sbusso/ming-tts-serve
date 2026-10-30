@@ -24,13 +24,32 @@ const wav = @import("wav.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const DEFAULT_MODEL = "/Users/sbusso/Code/dev/ming/models/Ming-3.0-tts-0.5b";
-pub const DEFAULT_OUTPUT = "/Users/sbusso/Code/dev/ming/outputs";
+/// Model directory used when neither `Config.model_dir` nor `MING_MODEL_DIR`
+/// is set, relative to the current directory.
+pub const DEFAULT_MODEL = "models/Ming-3.0-tts-0.5b";
+
+/// `$MING_MODEL_DIR`, else `DEFAULT_MODEL`.
+pub fn defaultModelDir() []const u8 {
+    if (std.c.getenv("MING_MODEL_DIR")) |p| return std.mem.span(p);
+    return DEFAULT_MODEL;
+}
+
+/// `$MING_OUTPUT_DIR`, else `$HOME/Library/Caches/ming-tts`, else
+/// `$TMPDIR/ming-tts`, else `/tmp/ming-tts`.
+pub fn defaultOutputDir(a: Allocator) ![]const u8 {
+    if (std.c.getenv("MING_OUTPUT_DIR")) |p| return a.dupe(u8, std.mem.span(p));
+    if (std.c.getenv("HOME")) |h| return std.fmt.allocPrint(a, "{s}/Library/Caches/ming-tts", .{std.mem.span(h)});
+    const tmp: []const u8 = if (std.c.getenv("TMPDIR")) |t| std.mem.trimEnd(u8, std.mem.span(t), "/") else "/tmp";
+    return std.fmt.allocPrint(a, "{s}/ming-tts", .{tmp});
+}
 
 pub const Config = struct {
-    model_dir: []const u8 = DEFAULT_MODEL,
-    /// Generated WAVs are written here (created if missing).
-    output_dir: []const u8 = DEFAULT_OUTPUT,
+    /// Empty: `defaultModelDir()`. A relative path is resolved against the
+    /// current directory when the service starts.
+    model_dir: []const u8 = "",
+    /// Generated WAVs are written here (created if missing). Empty:
+    /// `defaultOutputDir()`.
+    output_dir: []const u8 = "",
     max_text_chars: usize = ming.MAX_TEXT_CHARS,
     /// `engine` field of /health.
     engine_name: []const u8 = "mlx",
@@ -52,8 +71,16 @@ pub const Service = struct {
     /// The service lives for the rest of the process.
     pub fn start(io: std.Io, a: Allocator, cfg: Config) !*Service {
         mlx.installErrorHandler();
+        var c = cfg;
+        if (c.model_dir.len == 0) c.model_dir = defaultModelDir();
+        // The engine opens files by absolute path; a missing dir is reported by /health.
+        c.model_dir = std.Io.Dir.cwd().realPathFileAlloc(io, c.model_dir, a) catch c.model_dir;
+        if (c.output_dir.len == 0) c.output_dir = try defaultOutputDir(a);
+        // Responses carry absolute WAV paths, so resolve a relative dir once.
+        std.Io.Dir.cwd().createDirPath(io, c.output_dir) catch {};
+        c.output_dir = std.Io.Dir.cwd().realPathFileAlloc(io, c.output_dir, a) catch c.output_dir;
         const st = try a.create(Service);
-        st.* = .{ .io = io, .a = a, .cfg = cfg };
+        st.* = .{ .io = io, .a = a, .cfg = c };
         const th = try std.Thread.spawn(.{}, worker, .{st});
         th.detach();
         return st;

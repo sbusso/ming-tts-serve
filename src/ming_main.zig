@@ -1,12 +1,12 @@
 //! `ming-tts`: native Ming-3.0-tts-0.5b server and CLI (no Python).
 //!
-//!   ming-tts serve --model DIR [--host 127.0.0.1] [--port 8765] [--output-dir DIR]
-//!   ming-tts say   --model DIR --out x.wav --json '{"task":"IP","text":"Hi.","voice":"UK_George"}'
-//!   ming-tts bench --model DIR [--runs 3]
+//!   ming-tts serve [--model DIR] [--host 127.0.0.1] [--port 8765] [--output-dir DIR]
+//!   ming-tts say   [--model DIR] --out x.wav --json '{"task":"IP","text":"Hi.","voice":"UK_George"}'
+//!   ming-tts bench [--model DIR] [--runs 3] [--ref-wav ref.wav]
 //!
-//! `serve` implements the HTTP contract in ming/API.md (v1 + v2) with the
-//! same JSON as the Python server. Env defaults match it too: MING_PORT,
-//! MING_OUTPUT_DIR, MING_MAX_TEXT_CHARS. All MLX work runs on one worker
+//! `serve` implements the HTTP contract in API.md (v1 + v2) with the
+//! same JSON as the Python server. Env defaults: MING_MODEL_DIR, MING_PORT,
+//! MING_OUTPUT_DIR, MING_MAX_TEXT_CHARS, MING_REF_WAV (bench). All MLX work runs on one worker
 //! thread (MLX streams are per-thread); connection threads parse, validate
 //! and wait.
 
@@ -21,15 +21,16 @@ const ApiError = service.ApiError;
 
 const Allocator = std.mem.Allocator;
 
-const DEFAULT_MODEL = service.DEFAULT_MODEL;
-const DEFAULT_OUTPUT = service.DEFAULT_OUTPUT;
-
 const Config = struct {
-    model_dir: []const u8 = DEFAULT_MODEL,
+    /// Empty: `service.defaultModelDir()` ($MING_MODEL_DIR or models/Ming-3.0-tts-0.5b).
+    model_dir: []const u8 = "",
     host: []const u8 = "127.0.0.1",
     port: u16 = 8765,
-    output_dir: []const u8 = DEFAULT_OUTPUT,
+    /// Empty: `service.defaultOutputDir()` ($MING_OUTPUT_DIR or ~/Library/Caches/ming-tts).
+    output_dir: []const u8 = "",
     max_text_chars: usize = ming.MAX_TEXT_CHARS,
+    /// Voice-clone reference for `bench` ($MING_REF_WAV); the clone case is skipped without it.
+    ref_wav: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -45,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
 
     var cfg: Config = .{};
     if (std.c.getenv("MING_PORT")) |p| cfg.port = std.fmt.parseInt(u16, std.mem.span(p), 10) catch cfg.port;
-    if (std.c.getenv("MING_OUTPUT_DIR")) |p| cfg.output_dir = std.mem.span(p);
+    if (std.c.getenv("MING_REF_WAV")) |p| cfg.ref_wav = std.mem.span(p);
     if (std.c.getenv("MING_MAX_TEXT_CHARS")) |p| cfg.max_text_chars = std.fmt.parseInt(usize, std.mem.span(p), 10) catch cfg.max_text_chars;
     var json_arg: ?[]const u8 = null;
     var out_path: ?[]const u8 = null;
@@ -57,10 +58,17 @@ pub fn main(init: std.process.Init) !void {
         i += 1;
         if (std.mem.eql(u8, k, "--model")) cfg.model_dir = v else if (std.mem.eql(u8, k, "--host")) cfg.host = v else if (std.mem.eql(u8, k, "--port")) {
             cfg.port = try std.fmt.parseInt(u16, v, 10);
-        } else if (std.mem.eql(u8, k, "--output-dir")) cfg.output_dir = v else if (std.mem.eql(u8, k, "--json")) json_arg = v else if (std.mem.eql(u8, k, "--out")) out_path = v else if (std.mem.eql(u8, k, "--runs")) {
+        } else if (std.mem.eql(u8, k, "--output-dir")) cfg.output_dir = v else if (std.mem.eql(u8, k, "--json")) json_arg = v else if (std.mem.eql(u8, k, "--out")) out_path = v else if (std.mem.eql(u8, k, "--ref-wav")) cfg.ref_wav = v else if (std.mem.eql(u8, k, "--runs")) {
             runs = try std.fmt.parseInt(usize, v, 10);
         } else return usage();
     }
+    if (cfg.model_dir.len == 0) cfg.model_dir = service.defaultModelDir();
+    // The engine opens model files by absolute path.
+    cfg.model_dir = std.Io.Dir.cwd().realPathFileAlloc(io, cfg.model_dir, a) catch |e| {
+        std.debug.print("model dir {s}: {s} (set --model or MING_MODEL_DIR)\n", .{ cfg.model_dir, @errorName(e) });
+        std.process.exit(1);
+    };
+    defer a.free(cfg.model_dir);
     const cmd = args.items[1];
     if (std.mem.eql(u8, cmd, "serve")) return serve(io, a, cfg);
     if (std.mem.eql(u8, cmd, "say")) return say(io, a, cfg, json_arg orelse return usage(), out_path orelse return usage());
@@ -72,10 +80,10 @@ pub fn main(init: std.process.Init) !void {
 fn usage() void {
     std.debug.print(
         \\usage:
-        \\  ming-tts serve --model DIR [--host 127.0.0.1] [--port 8765] [--output-dir DIR]
-        \\  ming-tts say   --model DIR --out x.wav --json '{{"task":"IP","text":"Hi.","voice":"UK_George"}}'
-        \\  ming-tts bench --model DIR [--runs 3]
-        \\  ming-tts frontend --model DIR --json '[{{"task":"TTS","text":"..."}}]'   (fragments + token ids, no model load)
+        \\  ming-tts serve [--model DIR] [--host 127.0.0.1] [--port 8765] [--output-dir DIR]
+        \\  ming-tts say   [--model DIR] --out x.wav --json '{{"task":"IP","text":"Hi.","voice":"UK_George"}}'
+        \\  ming-tts bench [--model DIR] [--runs 3] [--ref-wav ref.wav]
+        \\  ming-tts frontend [--model DIR] --json '[{{"task":"TTS","text":"..."}}]'   (fragments + token ids, no model load)
         \\
     , .{});
 }
@@ -89,7 +97,7 @@ fn serve(io: std.Io, a: Allocator, cfg: Config) !void {
     const addr = try std.Io.net.IpAddress.parse(cfg.host, cfg.port);
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
-    std.debug.print("ming-tts listening on http://{s}:{d} (model {s}, outputs {s})\n", .{ cfg.host, cfg.port, cfg.model_dir, cfg.output_dir });
+    std.debug.print("ming-tts listening on http://{s}:{d} (model {s}, outputs {s})\n", .{ cfg.host, cfg.port, st.cfg.model_dir, st.cfg.output_dir });
     while (true) {
         const stream = server.accept(io) catch |e| {
             std.log.err("accept: {s}", .{@errorName(e)});
@@ -231,7 +239,6 @@ fn bench(io: std.Io, a: Allocator, cfg: Config, runs: usize) !void {
     defer eng.deinit();
     var d: ming.Diag = .{};
     a.free(try eng.tts("Warm up.", "UK_George", null, 0, &d));
-    const ref = "/Users/sbusso/Code/dev/ming/vendor/Ming-3.0-tts/data/voice_presets/voice_audio/lingguang.wav";
     const Case = struct { name: []const u8, clone: bool, txt: []const u8 };
     const cases = [_]Case{
         .{ .name = "tts-en", .clone = false, .txt = "The garden will remain open until sunset, provided the weather stays clear, and visitors are asked to leave by the north gate." },
@@ -239,6 +246,10 @@ fn bench(io: std.Io, a: Allocator, cfg: Config, runs: usize) !void {
         .{ .name = "clone", .clone = true, .txt = "I never thought a little machine could sound this much like me." },
     };
     for (cases) |c| {
+        const ref = if (c.clone) cfg.ref_wav orelse {
+            std.debug.print("zig        {s:<7} skipped (pass --ref-wav or MING_REF_WAV)\n", .{c.name});
+            continue;
+        } else "";
         var rtfs: std.ArrayList(f64) = .empty;
         defer rtfs.deinit(a);
         var durs: std.ArrayList(f64) = .empty;

@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
     const model_dir = it.next() orelse return usage();
     const ref_dir = it.next() orelse return usage();
     const mode = it.next() orelse "f32";
+    ref_wav = it.next() orelse if (std.c.getenv("MING_REF_WAV")) |p| std.mem.span(p) else return usage();
     const f32_mode = std.mem.eql(u8, mode, "f32");
     mlx.installErrorHandler();
 
@@ -95,6 +96,9 @@ pub fn main(init: std.process.Init) !void {
     const tol: f32 = if (f32_mode) 1e-4 else 1e-1;
     std.debug.print("mode={s} tol={e}\n", .{ mode, tol });
 
+    // The fused kernels are not bit-exact (ming_fused.zig); with them the
+    // free run can stop at a different step than the reference dump.
+    @import("ming_fused.zig").force_off = true;
     var eng = try engine.Engine.init(init.io, a, s, model_dir, .{ .cast_to = if (f32_mode) .float32 else null });
     // Parity is against upstream, which neither normalizes the reference nor limits the output.
     eng.normalize_prompt = false;
@@ -241,13 +245,15 @@ pub fn main(init: std.process.Init) !void {
     if (failed != 0) std.process.exit(1);
 }
 
-const REF_WAV = "/Users/sbusso/Code/dev/ming/vendor/Ming-3.0-tts/data/voice_presets/voice_audio/lingguang.wav";
+/// The voice-clone reference zig_ref_dump.py used (upstream's
+/// data/voice_presets/voice_audio/lingguang.wav).
+var ref_wav: []const u8 = "";
 const REF_TEXT = "诶，你今天有空吗？我们能不能聊聊这件事啊？";
 
 /// The requests zig_ref_dump.py CASES dumped.
 fn caseInput(case: []const u8) engine.text.TaskInput {
     if (std.mem.eql(u8, case, "ip")) return .{ .task = "IP", .text = "Good evening, and welcome to the late news.", .controls = .{ .ip = "UK_George" }, .use_zero_spk_emb = true };
-    return .{ .task = "TTS", .language_id = "English", .text = "The evening wind blew in from the mountain pass, and the clouds turned gold.", .prompt_wav_path = REF_WAV, .prompt_text = REF_TEXT, .use_spk_emb = true };
+    return .{ .task = "TTS", .language_id = "English", .text = "The evening wind blew in from the mountain pass, and the clouds turned gold.", .prompt_wav_path = ref_wav, .prompt_text = REF_TEXT, .use_spk_emb = true };
 }
 
 /// frontend.json: prepare_text fragments and build_input_ids for every task.
@@ -340,5 +346,5 @@ fn tokenTaskInput(name: []const u8) ?engine.text.TaskInput {
 }
 
 fn usage() void {
-    std.debug.print("usage: ming-parity <model_dir> <ref_dir> [f32|bf16]\n", .{});
+    std.debug.print("usage: ming-parity <model_dir> <ref_dir> [f32|bf16] [ref.wav]  (or MING_REF_WAV=ref.wav)\n", .{});
 }

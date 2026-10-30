@@ -1,0 +1,17 @@
+.{
+    .name = .ming_tts_serve,
+    .version = "0.1.0",
+    .fingerprint = 0x9726a0fbd8032277,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "patches",
+        "LICENSE",
+        "README.md",
+        "API.md",
+    },
+    .dependencies = .{},
+}

@@ -1,0 +1,6 @@
+[submodule "lib/mlx-src"]
+	path = lib/mlx-src
+	url = https://github.com/ml-explore/mlx
+[submodule "lib/mlxc-src"]
+	path = lib/mlxc-src
+	url = https://github.com/ml-explore/mlx-c

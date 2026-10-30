@@ -45,10 +45,13 @@ const MAX_ROWS = 6;
 /// (they split K).
 const Tile = struct { no: c_int, sg: c_int };
 
+/// Set by ming-parity: parity is defined against the mirrored MLX graph.
+pub var force_off = false;
+
 /// MING_FUSED=0 turns every fused path off; MING_FUSED_DIT=0 / MING_FUSED_LM=0
 /// turn off one part (A/B checks).
 pub fn enabled() bool {
-    return !envOff("MING_FUSED");
+    return !force_off and !envOff("MING_FUSED");
 }
 
 pub fn ditEnabled() bool {

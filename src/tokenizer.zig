@@ -1,6 +1,5 @@
 const std = @import("std");
 const log = @import("log.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
 const io_util = @import("io_util.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
@@ -1334,7 +1333,7 @@ fn buildBytesToUnicode() [256]u21 {
 
 /// Parse tokenizer.json and return a Tokenizer.
 pub fn loadTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
-    const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .tokenizer)) orelse blk: {
+    const content = blk: {
         const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_dir});
         defer allocator.free(path);
 
