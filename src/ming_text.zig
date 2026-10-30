@@ -1473,6 +1473,97 @@ pub fn prepareText(a: std.mem.Allocator, text_in: []const u8, language_id: ?[]co
     return out;
 }
 
+/// What separates a fragment from the next one; `Engine.synthesize` picks
+/// the pause length from it.
+pub const Boundary = enum { none, clause, sentence, paragraph };
+
+pub const Fragment = struct {
+    text: []u8,
+    /// The boundary after this fragment (`.none` for the last one).
+    after: Boundary,
+};
+
+pub fn freeFragments(a: std.mem.Allocator, frags: *std.ArrayList(Fragment)) void {
+    for (frags.items) |f| a.free(f.text);
+    frags.deinit(a);
+}
+
+/// `prepareText` for long text: split into paragraphs first, run
+/// `prepareText` on each, and tag every fragment with the boundary that
+/// follows it. A line break starts a new paragraph unless the line does not
+/// end a sentence and the next line starts with a lowercase letter (a hard
+/// wrap, joined with a space). Text without line breaks gives the same
+/// fragments as `prepareText`. Departs from upstream, which turns line breaks
+/// into spaces.
+pub fn prepareLongText(a: std.mem.Allocator, text_in: []const u8, language_id: ?[]const u8, max_len: usize) !std.ArrayList(Fragment) {
+    var out: std.ArrayList(Fragment) = .empty;
+    errdefer freeFragments(a, &out);
+    var paras = try splitParagraphs(a, text_in);
+    defer {
+        for (paras.items) |p| a.free(p);
+        paras.deinit(a);
+    }
+    for (paras.items) |p| {
+        var frags = prepareText(a, p, language_id, max_len) catch |e| switch (e) {
+            error.NoFragments => continue, // e.g. a line of dashes
+            else => return e,
+        };
+        defer frags.deinit(a);
+        if (out.items.len > 0) out.items[out.items.len - 1].after = .paragraph;
+        out.ensureUnusedCapacity(a, frags.items.len) catch |e| {
+            for (frags.items) |f| a.free(f);
+            return e;
+        };
+        for (frags.items) |f| out.appendAssumeCapacity(.{ .text = f, .after = if (endsSentence(f)) .sentence else .clause });
+    }
+    if (out.items.len == 0) return error.NoFragments;
+    out.items[out.items.len - 1].after = .none;
+    return out;
+}
+
+/// Paragraphs of `s` (owned UTF-8, non-blank), see `prepareLongText`.
+fn splitParagraphs(a: std.mem.Allocator, s: []const u8) !std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| a.free(p);
+        out.deinit(a);
+    }
+    var cur: std.ArrayList(u8) = .empty;
+    defer cur.deinit(a);
+    var lines = std.mem.splitAny(u8, s, "\n\r");
+    while (lines.next()) |raw| {
+        const line = strip(raw);
+        if (line.len == 0) {
+            if (cur.items.len > 0) try out.append(a, try cur.toOwnedSlice(a));
+            continue;
+        }
+        if (cur.items.len > 0) {
+            const hard_wrap = !endsSentence(cur.items) and std.ascii.isLower(line[0]);
+            if (hard_wrap) try cur.append(a, ' ') else try out.append(a, try cur.toOwnedSlice(a));
+        }
+        try cur.appendSlice(a, line);
+    }
+    if (cur.items.len > 0) try out.append(a, try cur.toOwnedSlice(a));
+    return out;
+}
+
+/// Ends with sentence punctuation, ignoring trailing spaces, closing quotes
+/// and brackets.
+fn endsSentence(s: []const u8) bool {
+    var e = s.len;
+    while (e > 0) {
+        var st = e - 1;
+        while (st > 0 and (s[st] & 0xc0) == 0x80) st -= 1;
+        const c = std.unicode.utf8Decode(s[st..e]) catch return false;
+        if (isSpace(c) or inSet(c, "\"')]}»”’」』）")) {
+            e = st;
+            continue;
+        }
+        return inSet(c, ".!?。！？…");
+    }
+    return false;
+}
+
 /// core.spoken_units: Latin words + every digit and non-ASCII letter.
 pub fn spokenUnits(text_utf8: []const u8) usize {
     var it = (std.unicode.Utf8View.init(text_utf8) catch return 0).iterator();
@@ -2006,4 +2097,32 @@ test "detectLanguage" {
         const got = detectLanguage(c[0]);
         if (c[1]) |want| try std.testing.expectEqualStrings(want, got orelse "null") else try std.testing.expectEqual(@as(?[]const u8, null), got);
     }
+}
+
+test "prepareLongText tags clause, sentence and paragraph boundaries" {
+    const a = std.testing.allocator;
+    const txt = "The garden will remain open until sunset, provided the weather stays clear, and visitors are asked to leave by the north gate. After that, the lights along the river path will switch on.\n\nChapter two\nIt was\nlate.";
+    var frags = try prepareLongText(a, txt, null, 24);
+    defer freeFragments(a, &frags);
+    // One paragraph without line breaks: the same fragments as prepareText.
+    var plain = try prepareText(a, txt[0..std.mem.indexOf(u8, txt, "\n").?], null, 24);
+    defer {
+        for (plain.items) |f| a.free(f);
+        plain.deinit(a);
+    }
+    for (plain.items, 0..) |f, i| try std.testing.expectEqualStrings(f, frags.items[i].text);
+    const n = plain.items.len;
+    try std.testing.expectEqual(Boundary.sentence, frags.items[0].after);
+    try std.testing.expectEqual(Boundary.paragraph, frags.items[n - 1].after);
+    // "Chapter two" is its own paragraph; "It was\nlate." is a hard wrap.
+    try std.testing.expectEqualStrings("Chapter two.", frags.items[n].text);
+    try std.testing.expectEqual(Boundary.paragraph, frags.items[n].after);
+    try std.testing.expectEqualStrings("It was late.", frags.items[n + 1].text);
+    try std.testing.expectEqual(Boundary.none, frags.items[n + 1].after);
+    try std.testing.expectEqual(n + 2, frags.items.len);
+    // A long sentence cut inside: the first piece ends at a clause.
+    var long = try prepareLongText(a, "雨后的山谷很安静，远处的云慢慢变成了金色，我们沿着小路走回了村子，路边的稻田在风里轻轻摇晃，狗在远处叫了几声。", null, 24);
+    defer freeFragments(a, &long);
+    try std.testing.expect(long.items.len > 1);
+    try std.testing.expectEqual(Boundary.clause, long.items[0].after);
 }

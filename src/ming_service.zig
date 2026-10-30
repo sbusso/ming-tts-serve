@@ -142,6 +142,23 @@ pub fn seedOf(o: Body, err: *?ApiError, a: Allocator) u64 {
     };
 }
 
+pub const Longform = struct { pause_scale: ?f32 = null };
+
+/// `pause_scale` (number, 0 to MAX_PAUSE_SCALE); null or absent: engine default.
+pub fn longformOf(o: Body, err: *?ApiError, a: Allocator) Longform {
+    var r: Longform = .{};
+    if (o.get("pause_scale")) |v| switch (v) {
+        .null => {},
+        .integer => |n| r.pause_scale = @floatFromInt(n),
+        .float => |x| r.pause_scale = @floatCast(x),
+        else => err.* = .{ .status = 400, .msg = std.fmt.allocPrint(a, "pause_scale: Input should be a valid number", .{}) catch "" },
+    };
+    if (r.pause_scale) |x| if (!(x >= 0 and x <= ming.MAX_PAUSE_SCALE)) {
+        err.* = .{ .status = 400, .msg = std.fmt.allocPrint(a, "pause_scale must be between 0 and {d}", .{ming.MAX_PAUSE_SCALE}) catch "" };
+    };
+    return r;
+}
+
 /// A parsed, validated job for the inference thread. Strings live in `arena`.
 const Job = struct {
     kind: enum { tts, clone, generate, warmup },
@@ -165,11 +182,7 @@ fn worker(st: *State) void {
         return;
     };
     defer eng.deinit();
-    // A/B switches for the two deliberate departures from upstream.
-    if (std.c.getenv("MING_PROMPT_NORM")) |v| eng.normalize_prompt = !std.mem.eql(u8, std.mem.span(v), "0");
-    if (std.c.getenv("MING_SOFT_LIMIT")) |v| eng.soft_limit = !std.mem.eql(u8, std.mem.span(v), "0");
-    if (std.c.getenv("MING_GUARD")) |v| eng.guard = !std.mem.eql(u8, std.mem.span(v), "0");
-    if (std.c.getenv("MING_FR_TN")) |v| ming.text.french_frontend = !std.mem.eql(u8, std.mem.span(v), "0");
+    configure(&eng);
     // Compile Metal kernels once so the first request is not slow.
     var d: ming.Diag = .{};
     if (eng.tts("Warm up.", "UK_George", null, 0, &d)) |w| {
@@ -190,6 +203,22 @@ fn worker(st: *State) void {
         st.cond.broadcast(st.io);
         st.mu.unlock(st.io);
     }
+}
+
+/// A/B switches for the deliberate departures from upstream ("0" turns one
+/// off): MING_PROMPT_NORM, MING_SOFT_LIMIT, MING_GUARD, MING_FR_TN, MING_JOIN.
+pub fn configure(eng: *ming.Engine) void {
+    const off = struct {
+        fn f(name: [*:0]const u8) ?bool {
+            const v = std.c.getenv(name) orelse return null;
+            return std.mem.eql(u8, std.mem.span(v), "0");
+        }
+    }.f;
+    if (off("MING_PROMPT_NORM")) |x| eng.normalize_prompt = !x;
+    if (off("MING_SOFT_LIMIT")) |x| eng.soft_limit = !x;
+    if (off("MING_GUARD")) |x| eng.guard = !x;
+    if (off("MING_FR_TN")) |x| ming.text.french_frontend = !x;
+    if (off("MING_JOIN")) |x| eng.join = !x;
 }
 
 /// Run one clone on `samples` so the prompt path (resampler, CAM++, VAE
@@ -215,6 +244,8 @@ fn runJob(eng: *ming.Engine, job: *Job) void {
     const r = job.req;
     eng.on_chunk = job.sink;
     defer eng.on_chunk = null;
+    const saved = eng.useOptions(r);
+    defer eng.restoreOptions(saved);
     const res = switch (job.kind) {
         .tts => eng.tts(r.text, r.voice, r.instruction, r.seed, &d),
         .clone => eng.clone(r.text, r.prompt_wav_path.?, r.prompt_text, r.seed, &d),
@@ -314,7 +345,8 @@ fn route(st: *State, a: Allocator, method: []const u8, path: []const u8, body: [
         try strList(a, &out, &text.BASIC_LEVEL);
         try out.appendSlice(a, "},\"paralinguistic_tags\":");
         try strList(a, &out, &text.PARALINGUISTIC_TAGS);
-        try out.print(a, ",\"max_prompt_s\":{d:.1},\"max_text_chars\":{d}}}", .{ ming.MAX_PROMPT_SECONDS, st.cfg.max_text_chars });
+        try out.print(a, ",\"max_prompt_s\":{d:.1},\"max_text_chars\":{d}", .{ ming.MAX_PROMPT_SECONDS, st.cfg.max_text_chars });
+        try out.print(a, ",\"pauses_s\":{{\"clause\":{d},\"sentence\":{d},\"paragraph\":{d}}},\"max_pause_scale\":{d}}}", .{ ming.PAUSE_CLAUSE_S, ming.PAUSE_SENTENCE_S, ming.PAUSE_PARAGRAPH_S, ming.MAX_PAUSE_SCALE });
         return out.toOwnedSlice(a);
     }
     const synth = std.mem.eql(u8, path, "/tts") or std.mem.eql(u8, path, "/clone") or std.mem.eql(u8, path, "/generate");
@@ -338,6 +370,8 @@ fn route(st: *State, a: Allocator, method: []const u8, path: []const u8, body: [
     job.* = .{ .kind = .generate, .arena = std.heap.ArenaAllocator.init(st.a), .sink = sink };
     defer job.arena.deinit();
     const seed = seedOf(o, &perr, a);
+    const lf = longformOf(o, &perr, a);
+    if (perr) |e| return errJson(a, status, e.status, e.msg);
     if (std.mem.eql(u8, path, "/tts")) {
         const voice = optStr(o, "voice", &perr, a);
         const instr = if (voice != null) null else optStr(o, "instruction", &perr, a);
@@ -398,6 +432,7 @@ fn route(st: *State, a: Allocator, method: []const u8, path: []const u8, body: [
         };
         job.req = r;
     }
+    job.req.pause_scale = lf.pause_scale;
     if (!st.loaded.load(.acquire)) return errJson(a, status, 503, st.load_error orelse "model is loading; poll /health");
     submit(st, job);
     if (job.err) |e| return errJson(a, status, e.status, e.msg);

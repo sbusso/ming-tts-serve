@@ -64,11 +64,13 @@ Lists what the loaded engine supports, so the UI builds its forms from data, not
   "basic": {"speed": ["慢速", "中速", "快速"], "pitch": ["低", "中", "高"], "volume": ["低", "中", "高"]},
   "paralinguistic_tags": ["[Breathing]", "[Cough]", "[Sigh]", "[Laughter]", "..."],
   "max_prompt_s": 20,
-  "max_text_chars": 1000
+  "max_text_chars": 50000,
+  "pauses_s": {"clause": 0.2, "sentence": 0.4, "paragraph": 0.85},
+  "max_pause_scale": 4
 }
 ```
 
-Values come from upstream Ming-3.0-tts `tts_tasks.py` and `frontend/toolkit.py` (`PARALINGUISTIC_TAGS`). `max_text_chars` follows `MING_MAX_TEXT_CHARS`.
+Values come from upstream Ming-3.0-tts `tts_tasks.py` and `frontend/toolkit.py` (`PARALINGUISTIC_TAGS`). `max_text_chars` follows `MING_MAX_TEXT_CHARS` (default 50000). `pauses_s` are the pauses inserted between text fragments at `pause_scale` 1 (see [Long text](#long-text)).
 
 ## POST /generate (v2)
 
@@ -102,6 +104,18 @@ Rules follow upstream `tts_tasks.build_task_generation_kwargs`:
 | VOICE_DESIGN | — | — | — | `controls.style` or `instruction` |
 
 Invalid combinations return 400 with the upstream error message. Response shape is the same as `/tts`.
+
+## Long text
+
+`/tts`, `/clone` and `/generate` accept text up to `max_text_chars` (default 50,000 Unicode characters, about an hour of speech). Longer text returns 400. The engine splits the text at line breaks (paragraphs), then sentences, then commas, generates the fragments one at a time, and joins them with a pause that depends on the boundary: `pauses_s.clause` inside a sentence, `pauses_s.sentence` at a sentence end, `pauses_s.paragraph` at a line break. Each pause is the gap from the end of one fragment's speech to the start of the next. The response is one WAV file.
+
+All three synthesis routes take one optional field for this:
+
+| Field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `pause_scale` | number, 0 to `max_pause_scale` | 1 | Multiplies the pauses. The gap never drops below 0.12 s. |
+
+An invalid value returns 400. Generation takes about 0.11 s per second of audio, so the response to a 5-minute text arrives after about 35 seconds; set client timeouts accordingly.
 
 ## Errors
 

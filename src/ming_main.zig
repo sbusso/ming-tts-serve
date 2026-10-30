@@ -6,7 +6,7 @@
 //!
 //! `serve` implements the HTTP contract in API.md (v1 + v2) with the
 //! same JSON as the Python server. Env defaults: MING_MODEL_DIR, MING_PORT,
-//! MING_OUTPUT_DIR, MING_MAX_TEXT_CHARS, MING_REF_WAV (bench). All MLX work runs on one worker
+//! MING_OUTPUT_DIR, MING_MAX_TEXT_CHARS (default 50000), MING_REF_WAV (bench). All MLX work runs on one worker
 //! thread (MLX streams are per-thread); connection threads parse, validate
 //! and wait.
 
@@ -194,6 +194,9 @@ fn readRequest(a: Allocator, r: *std.Io.Reader) !HttpReq {
 fn say(io: std.Io, a: Allocator, cfg: Config, json: []const u8, out: []const u8) !void {
     var eng = try ming.Engine.init(io, a, mlx.mlx_default_gpu_stream_new(), cfg.model_dir, .{});
     defer eng.deinit();
+    service.configure(&eng);
+    var prog: SayProgress = .{ .io = io, .t0 = std.Io.Timestamp.now(io, .awake) };
+    eng.on_chunk = .{ .ctx = &prog, .f = SayProgress.onChunk, .progress = SayProgress.onProgress };
     const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
     defer parsed.deinit();
     const o = parsed.value.object;
@@ -208,6 +211,12 @@ fn say(io: std.Io, a: Allocator, cfg: Config, json: []const u8, out: []const u8)
         .instruction = optStr(o, "instruction", &perr, a),
         .seed = seedOf(o, &perr, a),
     };
+    const lf = service.longformOf(o, &perr, a);
+    if (perr) |e| {
+        std.debug.print("error: {s}\n", .{e.msg});
+        return error.BadRequest;
+    }
+    r.pause_scale = lf.pause_scale;
     if (o.get("controls")) |cv| if (cv == .object) {
         var cit = cv.object.iterator();
         while (cit.next()) |kv| {
@@ -232,6 +241,21 @@ fn say(io: std.Io, a: Allocator, cfg: Config, json: []const u8, out: []const u8)
     const dur = @as(f64, @floatFromInt(samples.len)) / ming.SAMPLE_RATE;
     std.debug.print("{s}: {d:.2}s audio in {d:.2}s (rtf {d:.3}, includes first-call kernel compile)\n", .{ out, dur, el, el / dur });
 }
+
+/// Progress line on stderr for texts of more than one fragment.
+const SayProgress = struct {
+    io: std.Io,
+    t0: std.Io.Timestamp,
+    fn onChunk(_: ?*anyopaque, _: []const f32) void {}
+    fn onProgress(ctx: ?*anyopaque, p: ming.Progress) void {
+        const self: *SayProgress = @ptrCast(@alignCast(ctx.?));
+        if (p.total < 2 or p.done == 0) return;
+        const el = @as(f64, @floatFromInt(self.t0.untilNow(self.io, .awake).nanoseconds)) / 1e9;
+        const left = el * @as(f64, @floatFromInt(p.units_total - p.units_done)) / @as(f64, @floatFromInt(@max(p.units_done, 1)));
+        std.debug.print("\rfragment {d}/{d} ({d}%), {d:.1}s audio, about {d:.0}s left   ", .{ p.done, p.total, 100 * p.units_done / @max(p.units_total, 1), p.audio_s, left });
+        if (p.done == p.total) std.debug.print("\n", .{});
+    }
+};
 
 /// Same requests as engine-mlx/bench.py; median RTF over `runs` seeds after warm-up.
 fn bench(io: std.Io, a: Allocator, cfg: Config, runs: usize) !void {

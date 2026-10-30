@@ -34,7 +34,10 @@ const Arr = model.Arr;
 const G = model.G;
 
 pub const MAX_PROMPT_SECONDS: f32 = 20.0;
-pub const MAX_TEXT_CHARS: usize = 1000;
+/// Default request text limit (Unicode code points), about an hour of speech.
+/// Fragments are generated one at a time, so GPU memory does not grow with
+/// the text; the output buffer takes about 10.6 MB per minute of audio.
+pub const MAX_TEXT_CHARS: usize = 50_000;
 pub const V2_TASKS = [_][]const u8{ "TTS", "MULTILINGUAL", "BASIC", "EMOTION", "DIALECT", "IP", "FREEFORM", "VOICE_DESIGN" };
 
 /// One /generate request (API.md v2). Strings are borrowed.
@@ -50,6 +53,8 @@ pub const GenerateRequest = struct {
     /// Control keys the request named that `Controls` has no field for.
     unknown_controls: []const []const u8 = &.{},
     seed: ?u64 = 0,
+    /// Overrides `Engine.pause_scale` for this request.
+    pause_scale: ?f32 = null,
 };
 
 /// Receives audio as it is generated: mono f32 at SAMPLE_RATE, clamped to
@@ -57,7 +62,36 @@ pub const GenerateRequest = struct {
 pub const Sink = struct {
     ctx: ?*anyopaque,
     f: *const fn (ctx: ?*anyopaque, samples: []const f32) void,
+    /// Optional: called once before the first fragment (`done` 0) and after
+    /// each fragment, on the engine's thread.
+    progress: ?*const fn (ctx: ?*anyopaque, p: Progress) void = null,
 };
+
+/// Generation progress. `units` are spoken units (words, CJK characters);
+/// `units_done / units_total` tracks time better than fragment counts.
+pub const Progress = struct {
+    done: usize,
+    total: usize,
+    units_done: usize,
+    units_total: usize,
+    /// Seconds of audio produced so far, pauses included.
+    audio_s: f64,
+};
+
+/// Speech-to-speech gap between consecutive fragments, in seconds, by
+/// boundary (`Engine.join`). Measured from the end of one fragment's speech
+/// to the start of the next one's, so it includes `LEAD_PAD_S + TAIL_PAD_S`.
+pub const PAUSE_CLAUSE_S: f32 = 0.2;
+pub const PAUSE_SENTENCE_S: f32 = 0.4;
+pub const PAUSE_PARAGRAPH_S: f32 = 0.85;
+/// Audio kept before a fragment's speech onset and after its offset at a
+/// join (`audio.speechBounds`), so quiet onsets and decays are not cut.
+pub const LEAD_PAD_S: f32 = 0.04;
+pub const TAIL_PAD_S: f32 = 0.08;
+/// Raised-cosine fade on each cut edge.
+pub const FADE_S: f32 = 0.01;
+/// Upper bound for `pause_scale`.
+pub const MAX_PAUSE_SCALE: f32 = 4;
 
 pub const Engine = struct {
     /// Optional streaming callback for `synthesize` (and everything that calls it).
@@ -71,6 +105,13 @@ pub const Engine = struct {
     /// Regenerate fragments with an implausible speaking rate
     /// (`generateGuarded`). Off reproduces upstream exactly.
     guard: bool = true,
+    /// Join fragments with a pause chosen by the boundary between them
+    /// (clause, sentence, paragraph; see PAUSE_*_S), cutting the model's own
+    /// edge silence. Off concatenates fragments as upstream does.
+    join: bool = true,
+    /// Multiplies the boundary pauses for the next `synthesize` calls (0 to
+    /// MAX_PAUSE_SCALE). The gap never goes below LEAD_PAD_S + TAIL_PAD_S.
+    pause_scale: f32 = 1,
     a: std.mem.Allocator,
     io: std.Io,
     s: model.S,
@@ -108,7 +149,22 @@ pub const Engine = struct {
     /// samples at 44.1 kHz (owned). Field rules: API.md v2 table.
     pub fn generate(e: *Engine, r: GenerateRequest, d: *Diag) ![]f32 {
         const in = try mapGenerate(r, d);
+        const saved = e.useOptions(r);
+        defer e.restoreOptions(saved);
         return e.synthesize(in, r.seed);
+    }
+
+    pub const Options = struct { pause_scale: f32 };
+
+    /// Apply a request's `pause_scale`; returns the previous value.
+    pub fn useOptions(e: *Engine, r: GenerateRequest) Options {
+        const saved: Options = .{ .pause_scale = e.pause_scale };
+        if (r.pause_scale) |v| e.pause_scale = v;
+        return saved;
+    }
+
+    pub fn restoreOptions(e: *Engine, o: Options) void {
+        e.pause_scale = o.pause_scale;
     }
 
     /// POST /tts: built-in voice, voice design, or the default voice.
@@ -217,35 +273,26 @@ pub const Engine = struct {
             prompt_latent = null;
         };
 
-        var frags = try text.prepareText(a, req.text, req.text_language, 24);
-        defer {
-            for (frags.items) |f| a.free(f);
-            frags.deinit(a);
-        }
+        var frags = try text.prepareLongText(a, req.text, req.text_language, 24);
+        defer text.freeFragments(a, &frags);
         var zero = req.use_zero_spk_emb;
         const reuse_first = req.taskname == .STYLE and frags.items.len > 1;
         var out: std.ArrayList(f32) = .empty;
         errdefer out.deinit(a);
         var reused_text: ?[]u8 = null;
         defer if (reused_text) |x| a.free(x);
-        for (frags.items, 0..) |frag, i| {
+        const prof = std.c.getenv("MING_PROFILE") != null;
+        var units_total: usize = 0;
+        for (frags.items) |f| units_total += text.spokenUnits(f.text);
+        var units_done: usize = 0;
+        e.report(.{ .done = 0, .total = frags.items.len, .units_done = 0, .units_total = units_total, .audio_s = 0 });
+        const last = frags.items.len - 1;
+        for (frags.items, 0..) |f, i| {
+            const frag = f.text;
             const chunk = try e.generateGuarded(req, frag, spk, prompt_latent, prompt_text, zero);
             defer a.free(chunk);
-            const trimmed = audio.trimTrailingSilence(chunk, SAMPLE_RATE);
-            if (e.soft_limit) audio.softLimit(chunk[0..trimmed.len]);
-            if (e.on_chunk) |sink| {
-                const clamped = try a.dupe(f32, trimmed);
-                defer a.free(clamped);
-                for (clamped) |*x| x.* = std.math.clamp(x.*, -1.0, 1.0);
-                sink.f(sink.ctx, clamped);
-            }
-            if (std.c.getenv("MING_PROFILE") != null) {
-                const units = text.spokenUnits(frag);
-                const secs = @as(f64, @floatFromInt(trimmed.len)) / SAMPLE_RATE;
-                const steps = chunk.len / model.PAD_ALIGN;
-                std.debug.print("[ming] frag {d}: {d} units, {d}/{d} steps, {d:.2}s, {d:.2} units/s: {s}\n", .{ i, units, steps, model.BASE_STEPS + model.STEPS_PER_UNIT * units, secs, @as(f64, @floatFromInt(units)) / secs, frag });
-            }
-            try out.appendSlice(a, trimmed);
+            const trimmed = chunk[0..audio.trimTrailingSilence(chunk, SAMPLE_RATE).len];
+            if (e.soft_limit) audio.softLimit(trimmed);
             if (reuse_first and i == 0) {
                 // VOICE_DESIGN/FREEFORM: later fragments clone the first one's voice.
                 const w16 = try audio.resample(a, trimmed, SAMPLE_RATE, 16000);
@@ -260,8 +307,82 @@ pub const Engine = struct {
                 prompt_text = reused_text;
                 zero = false;
             }
+            // Joins (`join`): cut each side of a fragment boundary to its speech
+            // plus a short pad, fade the cut edges, and put a pause between.
+            // The start of the first and the end of the last fragment keep the
+            // model's own silence, so one-fragment text is unchanged.
+            // Pads shorter than LEAD_PAD_S / TAIL_PAD_S are made up with
+            // silence, so the speech-to-speech gap is the boundary's pause.
+            var seg = trimmed;
+            const joined = e.join and last > 0;
+            var tail_fill: usize = 0;
+            if (joined) {
+                const b = audio.speechBounds(trimmed, SAMPLE_RATE);
+                if (b.end > b.start) {
+                    const lo = if (i > 0) b.start -| nsamp(LEAD_PAD_S) else 0;
+                    const hi = if (i < last) @min(trimmed.len, b.end + nsamp(TAIL_PAD_S)) else trimmed.len;
+                    seg = trimmed[lo..hi];
+                    if (i > 0) {
+                        audio.fade(seg, @min(nsamp(FADE_S), b.start - lo), .in);
+                        try e.emitSilence(&out, nsamp(LEAD_PAD_S) - (b.start - lo));
+                    }
+                    if (i < last) {
+                        audio.fade(seg, nsamp(FADE_S), .out);
+                        tail_fill = nsamp(TAIL_PAD_S) - (hi - b.end);
+                    }
+                }
+                if (prof) std.debug.print("[ming] join frag {d}: lead {d:.0} ms, tail {d:.0} ms, speech {d:.1} dBFS, cut to {d:.2}s\n", .{ i, ms(b.start), ms(trimmed.len -| b.end), audio.speechRmsDb(trimmed, SAMPLE_RATE), @as(f64, @floatFromInt(seg.len)) / SAMPLE_RATE });
+            }
+            try e.emit(&out, seg);
+            if (prof) {
+                const units = text.spokenUnits(frag);
+                const dur = @as(f64, @floatFromInt(trimmed.len)) / SAMPLE_RATE;
+                const steps = chunk.len / model.PAD_ALIGN;
+                std.debug.print("[ming] frag {d}: {d} units, {d}/{d} steps, {d:.2}s, {d:.2} units/s, then {s}: {s}\n", .{ i, units, steps, model.BASE_STEPS + model.STEPS_PER_UNIT * units, dur, @as(f64, @floatFromInt(units)) / dur, @tagName(f.after), frag });
+            }
+            if (joined and i < last) {
+                const gap = e.pauseSeconds(f.after);
+                if (prof) std.debug.print("[ming] pause at {d:.2}s: {s} {d:.0} ms\n", .{ @as(f64, @floatFromInt(out.items.len)) / SAMPLE_RATE, @tagName(f.after), gap * 1000 });
+                try e.emitSilence(&out, tail_fill + nsamp(@max(0, gap - LEAD_PAD_S - TAIL_PAD_S)));
+            }
+            units_done += text.spokenUnits(frag);
+            e.report(.{ .done = i + 1, .total = frags.items.len, .units_done = units_done, .units_total = units_total, .audio_s = @as(f64, @floatFromInt(out.items.len)) / SAMPLE_RATE });
         }
         return out.toOwnedSlice(a);
+    }
+
+    fn pauseSeconds(e: *const Engine, b: text.Boundary) f32 {
+        const base: f32 = switch (b) {
+            .none => 0,
+            .clause => PAUSE_CLAUSE_S,
+            .sentence => PAUSE_SENTENCE_S,
+            .paragraph => PAUSE_PARAGRAPH_S,
+        };
+        return base * std.math.clamp(e.pause_scale, 0, MAX_PAUSE_SCALE);
+    }
+
+    fn report(e: *Engine, p: Progress) void {
+        const sink = e.on_chunk orelse return;
+        if (sink.progress) |f| f(sink.ctx, p);
+    }
+
+    /// Append to the output and stream a clamped copy to `on_chunk`.
+    fn emit(e: *Engine, out: *std.ArrayList(f32), samples: []const f32) !void {
+        if (samples.len == 0) return;
+        try out.appendSlice(e.a, samples);
+        const sink = e.on_chunk orelse return;
+        const added = out.items[out.items.len - samples.len ..];
+        const clamped = try e.a.dupe(f32, added);
+        defer e.a.free(clamped);
+        for (clamped) |*x| x.* = std.math.clamp(x.*, -1.0, 1.0);
+        sink.f(sink.ctx, clamped);
+    }
+
+    fn emitSilence(e: *Engine, out: *std.ArrayList(f32), n: usize) !void {
+        if (n == 0) return;
+        const start = out.items.len;
+        try out.appendNTimes(e.a, 0, n);
+        if (e.on_chunk) |sink| sink.f(sink.ctx, out.items[start..]);
     }
 
     /// `generateFragment` with a check for failed generations: a fragment
@@ -401,12 +522,20 @@ pub const RequestView = struct {
     use_zero_spk_emb: bool,
 };
 
-/// Front-pad to a multiple of 3528 samples (hop × VAE patch), owned.
+fn nsamp(s: f32) usize {
+    return @intFromFloat(@round(@max(s, 0) * SAMPLE_RATE));
+}
+
+fn ms(n: usize) f64 {
+    return @as(f64, @floatFromInt(n)) * 1000 / SAMPLE_RATE;
+}
+
 fn lap(io: std.Io, t: *std.Io.Timestamp, what: []const u8) void {
     std.debug.print("[ming] {s}: {d:.1} ms\n", .{ what, @as(f64, @floatFromInt(t.untilNow(io, .awake).nanoseconds)) / 1e6 });
     t.* = std.Io.Timestamp.now(io, .awake);
 }
 
+/// Front-pad to a multiple of 3528 samples (hop × VAE patch), owned.
 pub fn padPrompt(a: std.mem.Allocator, w: []const f32) ![]f32 {
     const r = w.len % model.PAD_ALIGN;
     const pad = if (r == 0) 0 else model.PAD_ALIGN - r;
