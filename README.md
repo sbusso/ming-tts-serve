@@ -10,39 +10,115 @@ It provides:
 
 All Ming tasks are supported: TTS, voice cloning, MULTILINGUAL, BASIC, EMOTION, DIALECT, IP (built-in voices), FREEFORM and VOICE_DESIGN.
 
-## Requirements
+## Quick start
 
-- A Mac with Apple silicon.
-- macOS 26.2 or later. MLX is built with deployment target 26.2 so that its NAX kernels (M5 neural accelerators) are compiled in.
-- Xcode 26.2 or later with the Metal toolchain. If `xcrun metal` is missing, run `xcodebuild -downloadComponent MetalToolchain`.
-- CMake, to build MLX.
-- Zig 0.17.
+These steps take you from a new Mac to spoken audio in about 10 minutes. Most of that time is the model download and the first build of MLX.
 
-## Get the model
+### 1. Check the requirements
+
+- A Mac with Apple silicon (M1 or later; the fused kernels are tuned for M5).
+- macOS 26.2 or later.
+- About 5 GB of free disk space: 3 GB for the model, the rest for MLX and the build.
+
+### 2. Install the tools
+
+1. Install Xcode 26.2 or later from the App Store, then open it once to accept the license.
+2. Install the Metal toolchain:
+
+   ```sh
+   xcodebuild -downloadComponent MetalToolchain
+   ```
+
+3. Install Zig 0.17, CMake and uv with [Homebrew](https://brew.sh):
+
+   ```sh
+   brew install zig cmake uv
+   ```
+
+4. Check the versions:
+
+   ```sh
+   zig version          # 0.17.0
+   xcrun -f metal       # prints a path
+   ```
+
+### 3. Get the code and build it
+
+```sh
+git clone --recurse-submodules https://github.com/sbusso/ming-tts-serve.git
+cd ming-tts-serve
+zig build -Doptimize=ReleaseFast
+```
+
+The first build compiles the pinned MLX and mlx-c submodules into `lib/mlx` (about 2 minutes on an M5 Max). Later builds reuse it. The binaries are written to `zig-out/bin`.
+
+If you cloned without `--recurse-submodules`, run `git submodule update --init` first.
+
+### 4. Download the model
+
+Run this in the `ming-tts-serve` folder. The tools look for the model in `models/Ming-3.0-tts-0.5b` by default:
 
 ```sh
 uvx --from huggingface_hub hf download inclusionAI/Ming-3.0-tts-0.5b --local-dir models/Ming-3.0-tts-0.5b
 ```
 
-The tools look for the model in `models/Ming-3.0-tts-0.5b` under the current directory. Use `--model DIR` or set `MING_MODEL_DIR` to point elsewhere.
+To keep the model somewhere else, pass `--model DIR` or set `MING_MODEL_DIR`.
 
-## Build
+### 5. Make your first audio
 
 ```sh
-git clone --recurse-submodules <this repo> ming-tts-serve
-cd ming-tts-serve
-zig build -Doptimize=ReleaseFast
+zig-out/bin/ming-tts say --out hello.wav \
+  --json '{"task":"IP","voice":"UK_George","text":"Hello from Ming."}'
+afplay hello.wav
 ```
 
-The first build compiles the pinned MLX and mlx-c submodules (`lib/mlx-src`, `lib/mlxc-src`) into `lib/mlx` with `scripts/build-mlx.sh` (about two minutes on an M5 Max). Later builds reuse `lib/mlx`. After you move a submodule to a new commit, run `zig build mlx` to rebuild it.
+### 6. Clone a voice
 
-The binaries are written to `zig-out/bin`. They find `libmlxc.dylib` and `mlx.metallib` in `lib/mlx/lib` through a path relative to the binary, so keep `zig-out` inside the checkout.
+Record 5 to 15 seconds of clean speech, and write down exactly what you said:
 
-Run the unit tests with:
+```sh
+zig-out/bin/ming-tts say --out clone.wav --json '{
+  "task": "TTS",
+  "text": "This is my cloned voice.",
+  "prompt_wav_path": "/abs/path/my-voice.wav",
+  "prompt_text": "Exact transcript of my-voice.wav."
+}'
+afplay clone.wav
+```
+
+For French, German, Spanish, Japanese or Korean, use `"task": "MULTILINGUAL"` with `"language": "fr"` (or `de`, `es`, `ja`, `ko`).
+
+### 7. Run the server
+
+```sh
+zig-out/bin/ming-tts serve
+```
+
+In another terminal:
+
+```sh
+curl -s localhost:8765/health      # wait for "loaded": true
+curl -s localhost:8765/tts -H 'Content-Type: application/json' \
+  -d '{"text":"Hello from the server."}'
+```
+
+The response holds the path of the generated WAV file. See [Run the server](#run-the-server) for options and [API.md](API.md) for every route.
+
+### 8. Run the tests (optional)
 
 ```sh
 zig build test
 ```
+
+### Troubleshooting
+
+| Problem | Fix |
+| --- | --- |
+| `xcrun: error: unable to find utility "metal"` | Run `xcodebuild -downloadComponent MetalToolchain`. |
+| `cmake: command not found` during the first build | Run `brew install cmake`. |
+| Build fails in `lib/mlx-src` or `lib/mlxc-src` | Run `git submodule update --init`, then `zig build mlx`. |
+| `missing weight` or `FileNotFound` at start | The model is not in `models/Ming-3.0-tts-0.5b`. Pass `--model DIR` or set `MING_MODEL_DIR`. |
+| `dyld: Library not loaded: libmlxc.dylib` | Run the binaries from `zig-out/bin` inside the checkout; they find MLX through a relative path. |
 
 ## Use the CLI
 
@@ -140,17 +216,35 @@ const json = try svc.handle(arena, "POST", "/generate", body, &status);
 
 `Service.handle` takes the same JSON as the HTTP server and returns the same JSON. `Service.handleStream` also passes each text fragment's audio to a callback as soon as it is generated. For a typed API without JSON, use `ming.engine` (`src/ming_tts.zig`). All MLX work runs on one engine thread, so `handle` can be called from any thread.
 
-## Performance
+## Engine comparison
 
-Median real-time factor from `ming-tts bench --runs 3` on an Apple M5 Max (macOS 27), bf16 weights. Lower is faster; 0.1 means 10 seconds of audio in 1 second.
+The same three requests on each engine: an English sentence and a Chinese sentence with a built-in voice, and a voice clone from a 4-second reference clip. Each request runs 3 times with seeds 0–2 after a warm-up; the table shows the median real-time factor (RTF), which is generation time divided by audio duration. Lower is faster: 0.1 means 10 seconds of audio in 1 second.
 
-| Request | Plain MLX graph (`MING_FUSED=0`) | Fused kernels (default) |
-| --- | --- | --- |
-| TTS, English | 0.142 | 0.103–0.108 |
-| TTS, Chinese | 0.141 | 0.110 |
-| Voice clone | 0.149 | 0.116 |
+Measured on an Apple M5 Max (128 GB, macOS 27.0.1), bf16 weights, one request at a time, on October 30, 2026.
 
-The plain MLX graph is itself pipelined and compiled; before those changes it ran at about 0.159 for TTS.
+| Engine | TTS, English | TTS, Chinese | Voice clone | Speed vs. official |
+| --- | --- | --- | --- | --- |
+| Official [Ming-3.0-tts](https://github.com/inclusionAI/Ming-3.0-tts) code, PyTorch 2.6.0 on MPS | 1.842 | 1.936 | 1.949 | 1× |
+| [mlx-audio](https://github.com/Blaizzy/mlx-audio) 0.6.3, Python, MLX 0.32.4 | 0.199 | 0.207 | 0.208 | about 9× |
+| ming-tts-serve, plain MLX graph (`MING_FUSED=0`) | 0.141 | 0.152 | 0.151 | about 13× |
+| **ming-tts-serve, fused kernels (default)** | **0.108** | **0.111** | **0.117** | **about 17×** |
+
+What makes the difference:
+
+- **mlx-audio vs. PyTorch:** the same Python pipeline on MLX instead of PyTorch's MPS backend.
+- **Plain MLX graph vs. mlx-audio:** no Python, the whole flow-matching sampler compiled as one graph, the next decode step queued while the GPU runs the current one, and fixed tables (rotary, timestep embeddings) computed once at load. The output matches the Python MLX engine (see [Check parity](#check-parity)).
+- **Fused kernels vs. plain MLX graph:** custom Metal kernels run each DiT block as 4 GPU dispatches instead of about 15 and read each weight once per Euler step. This cuts the flow head from about 2,350 to about 340 dispatches per decode step. Speech quality is unchanged: word error rate and speaker similarity match the plain graph on 19 test cases × 3 seeds (see `MING_FUSED` in [Environment switches](#environment-switches)).
+
+Other differences that matter in practice:
+
+| | Official code | mlx-audio | ming-tts-serve |
+| --- | --- | --- | --- |
+| Time to first audio | full request | full request | about 0.7 s (streams each text fragment) |
+| Runtime | Python, PyTorch | Python, MLX | one native binary, no Python |
+| Tasks | all | all | all |
+| French numbers and typography | digits left to the model | digits left to the model | spelled out in French (`MING_FR_TN`) |
+
+The PyTorch and mlx-audio numbers come from the harnesses in the companion app repository (`server/` and `engine-mlx/bench.py`). The ming-tts-serve numbers come from `ming-tts bench --runs 3 --ref-wav lingguang.wav`.
 
 ## Check parity
 
