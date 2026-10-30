@@ -1413,6 +1413,22 @@ pub fn isFrench(language_id: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(l, "fr") or std.ascii.eqlIgnoreCase(l, "french") or std.ascii.startsWithIgnoreCase(l, "fr-") or std.ascii.startsWithIgnoreCase(l, "fr_");
 }
 
+/// Text without a language_id (TTS, IP, EMOTION, BASIC, DIALECT, FREEFORM,
+/// VOICE_DESIGN) that `detectLanguage` reads as French, German, Spanish,
+/// Japanese or Korean takes the MULTILINGUAL text path: no zh/en
+/// normalization (which spells numbers in English and turns accented letters
+/// into "，"), and the French normalizer for fr. Departs from upstream, which
+/// sends such text through the zh/en path (MING_LANG_DETECT).
+/// - `text`: the text only.
+/// - `auto`: also add the "Target language: X." line for TTS, BASIC and
+///   EMOTION, where the voice comes from a reference clip or from none. Not
+///   for IP, FREEFORM and VOICE_DESIGN: there the line moves the captioned
+///   voice (UK_George on French: CAM++ 0.75 to its English voice with the
+///   line, 0.94 without). Not for DIALECT, which upstream keeps languageless.
+/// - `prompt`: the line for every task but DIALECT.
+pub const DetectLanguage = enum { off, text, auto, prompt };
+pub var detect_language: DetectLanguage = .auto;
+
 /// MULTILINGUAL fr/de/es: the cutter rewrites the punctuation it splits on
 /// to the Chinese full-width forms ("Bonjour à tous，voici …。"), as upstream
 /// does. Put the ASCII forms back (Latin-script languages only; Japanese
@@ -1823,7 +1839,14 @@ pub fn buildRequest(a: std.mem.Allocator, in: TaskInput, d: *Diag) !Request {
         if (has_controls) return d.set("{s} does not accept controls", .{task});
         instruction = try normalizeInstruction(a, in.instruction);
     }
-    const prompt = try buildTtsPrompt(a, language_id);
+    const detected = if (language_id != null and !isBlank(language_id.?) or detect_language == .off) null else detectLanguage(text_s);
+    const text_language = detected orelse language_id;
+    const line = runtime.? != .DIALECT and switch (detect_language) {
+        .off, .text => false,
+        .auto => runtime.? == .TTS or runtime.? == .BASIC or runtime.? == .EMOTION,
+        .prompt => true,
+    };
+    const prompt = try buildTtsPrompt(a, if (line and detected != null) detected else language_id);
     errdefer a.free(prompt);
     return .{
         .prompt = prompt,
@@ -1837,7 +1860,7 @@ pub fn buildRequest(a: std.mem.Allocator, in: TaskInput, d: *Diag) !Request {
         .sigma = in.sigma,
         .temperature = in.temperature,
         .taskname = runtime.?,
-        .text_language = language_id,
+        .text_language = text_language,
     };
 }
 
@@ -2097,6 +2120,54 @@ test "detectLanguage" {
         const got = detectLanguage(c[0]);
         if (c[1]) |want| try std.testing.expectEqualStrings(want, got orelse "null") else try std.testing.expectEqual(@as(?[]const u8, null), got);
     }
+}
+
+test "buildRequest routes detected fr/de/es/ja/ko text off the zh/en path" {
+    const a = std.testing.allocator;
+    const saved = detect_language;
+    defer detect_language = saved;
+    const fr = "En 1895, 96 % des billets coûtaient 100 €. C'est l'été.";
+    const Case = struct { mode: DetectLanguage, in: TaskInput, lang: ?[]const u8, line: ?[]const u8 };
+    const cases = [_]Case{
+        // Captioned voices: the text only.
+        .{ .mode = .auto, .in = .{ .task = "IP", .text = fr, .controls = .{ .ip = "UK_George" } }, .lang = "fr", .line = null },
+        .{ .mode = .auto, .in = .{ .task = "FREEFORM", .text = fr, .instruction = "A calm voice." }, .lang = "fr", .line = null },
+        .{ .mode = .auto, .in = .{ .task = "DIALECT", .text = fr, .controls = .{ .dialect = "cantonese" } }, .lang = "fr", .line = null },
+        // Voice from a reference clip or none: the line too.
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = fr }, .lang = "fr", .line = "French" },
+        .{ .mode = .auto, .in = .{ .task = "EMOTION", .text = fr, .controls = .{ .emotion = "中性" } }, .lang = "fr", .line = "French" },
+        .{ .mode = .auto, .in = .{ .task = "BASIC", .text = "Guten Morgen, heute scheint die Sonne und wir gehen in den Park.", .controls = .{ .speed = "中速" } }, .lang = "de", .line = "German" },
+        .{ .mode = .prompt, .in = .{ .task = "IP", .text = fr, .controls = .{ .ip = "UK_George" } }, .lang = "fr", .line = "French" },
+        .{ .mode = .text, .in = .{ .task = "TTS", .text = fr }, .lang = "fr", .line = null },
+        .{ .mode = .off, .in = .{ .task = "TTS", .text = fr }, .lang = null, .line = null },
+        // zh/en text and explicit languages are left alone.
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = "The garden stays open until sunset, and visitors leave by the north gate." }, .lang = null, .line = null },
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = "今天天气很好，我们一起去公园散步吧。" }, .lang = null, .line = null },
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = fr, .language_id = "English" }, .lang = "English", .line = "English" },
+    };
+    for (cases) |c| {
+        detect_language = c.mode;
+        var d: Diag = .{};
+        const req = try buildRequest(a, c.in, &d);
+        defer req.deinit(a);
+        try std.testing.expectEqualStrings(c.lang orelse "null", req.text_language orelse "null");
+        const want = if (c.line) |l| try std.fmt.allocPrint(a, "{s}Target language: {s}.\n", .{ DEFAULT_TTS_PROMPT, l }) else try a.dupe(u8, DEFAULT_TTS_PROMPT);
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, req.prompt);
+    }
+    // The French path spells the numbers in French and keeps the accents.
+    detect_language = .auto;
+    var d: Diag = .{};
+    const req = try buildRequest(a, .{ .task = "IP", .text = fr, .controls = .{ .ip = "UK_George" } }, &d);
+    defer req.deinit(a);
+    var frags = try prepareText(a, req.text, req.text_language, 24);
+    defer {
+        for (frags.items) |f| a.free(f);
+        frags.deinit(a);
+    }
+    const joined = try std.mem.join(a, " ", frags.items);
+    defer a.free(joined);
+    try std.testing.expectEqualStrings("En mille huit cent quatre-vingt-quinze, quatre-vingt-seize pour cent des billets coûtaient cent euros. C'est l'été.", joined);
 }
 
 test "prepareLongText tags clause, sentence and paragraph boundaries" {

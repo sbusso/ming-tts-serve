@@ -217,14 +217,7 @@ fn say(io: std.Io, a: Allocator, cfg: Config, json: []const u8, out: []const u8)
         return error.BadRequest;
     }
     r.pause_scale = lf.pause_scale;
-    if (o.get("controls")) |cv| if (cv == .object) {
-        var cit = cv.object.iterator();
-        while (cit.next()) |kv| {
-            const k = kv.key_ptr.*;
-            const v = kv.value_ptr.string;
-            if (std.mem.eql(u8, k, "speed")) r.controls.speed = v else if (std.mem.eql(u8, k, "pitch")) r.controls.pitch = v else if (std.mem.eql(u8, k, "volume")) r.controls.volume = v else if (std.mem.eql(u8, k, "emotion")) r.controls.emotion = v else if (std.mem.eql(u8, k, "dialect")) r.controls.dialect = v else if (std.mem.eql(u8, k, "style")) r.controls.style = v;
-        }
-    };
+    r.controls = controlsOf(o);
     var d: ming.Diag = .{};
     const t0 = std.Io.Timestamp.now(io, .awake);
     const samples = eng.generate(r, &d) catch |e| {
@@ -299,8 +292,21 @@ fn bench(io: std.Io, a: Allocator, cfg: Config, runs: usize) !void {
 /// Text frontend dump for comparison with the Python one: for each request,
 /// the prompt, the fragments `prepare_text` makes and each fragment's token
 /// ids (no speaker slot, no prompt transcript). Loads only the tokenizer.
+fn controlsOf(o: std.json.ObjectMap) ming.text.Controls {
+    var c: ming.text.Controls = .{};
+    if (o.get("controls")) |cv| if (cv == .object) {
+        var cit = cv.object.iterator();
+        while (cit.next()) |kv| {
+            const k = kv.key_ptr.*;
+            const v = kv.value_ptr.string;
+            if (std.mem.eql(u8, k, "speed")) c.speed = v else if (std.mem.eql(u8, k, "pitch")) c.pitch = v else if (std.mem.eql(u8, k, "volume")) c.volume = v else if (std.mem.eql(u8, k, "emotion")) c.emotion = v else if (std.mem.eql(u8, k, "dialect")) c.dialect = v else if (std.mem.eql(u8, k, "style")) c.style = v;
+        }
+    };
+    return c;
+}
+
 fn frontend(io: std.Io, a: Allocator, cfg: Config, json: []const u8) !void {
-    if (std.c.getenv("MING_FR_TN")) |v| ming.text.french_frontend = !std.mem.eql(u8, std.mem.span(v), "0");
+    service.configureText();
     var tok = try @import("tokenizer.zig").loadTokenizerAny(io, a, cfg.model_dir);
     defer tok.deinit();
     const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
@@ -321,7 +327,7 @@ fn frontend(io: std.Io, a: Allocator, cfg: Config, json: []const u8) !void {
         };
         var d: ming.Diag = .{};
         // The upstream kwargs directly (no API.md reference checks).
-        var in: ming.text.TaskInput = .{ .task = r.task, .text = r.text, .language_id = r.language };
+        var in: ming.text.TaskInput = .{ .task = r.task, .text = r.text, .language_id = r.language, .controls = controlsOf(o) };
         if (r.voice) |v| in.controls.ip = v;
         const req = ming.text.buildRequest(a, in, &d) catch |e| {
             std.debug.print("error: {s}\n", .{d.msg()});

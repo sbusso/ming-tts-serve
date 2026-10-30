@@ -207,7 +207,8 @@ pub const Engine = struct {
         return e.synthesizeChecked(.{
             .task = "TTS",
             .text = txt,
-            .language_id = if (isChineseUtf8(txt)) "Chinese" else "English",
+            // null lets buildRequest detect fr/de/es/ja/ko (MING_LANG_DETECT).
+            .language_id = if (isChineseUtf8(txt)) "Chinese" else if (text.detect_language != .off and text.detectLanguage(txt) != null) null else "English",
             .prompt_wav_path = prompt_wav_path,
             .prompt_text = prompt_text,
             .use_spk_emb = true,

@@ -138,6 +138,8 @@ afplay clone.wav
 
 For French, German, Spanish, Japanese or Korean, use `"task": "MULTILINGUAL"` with `"language": "fr"` (or `de`, `es`, `ja`, `ko`).
 
+Other tasks detect these languages from the text (see `MING_LANG_DETECT`). Detected text keeps its accents and skips the Chinese/English normalizer, and French numbers are spelled out in French. TTS, BASIC and EMOTION also get the `Target language:` prompt line. IP, FREEFORM and VOICE_DESIGN do not, because the line changes the built-in or described voice. Upstream sends such text through the Chinese/English normalizer, which spells numbers in English and replaces accented letters with `，`.
+
 ### 7. Run the server
 
 ```sh
@@ -255,11 +257,12 @@ These switches change engine behavior. They exist for A/B comparisons and diagno
 | `MING_SOFT_LIMIT` | on | Soft-limit output peaks (ceiling 0.98) instead of hard clipping at 1.0. |
 | `MING_GUARD` | on | Regenerate text fragments whose speaking rate is implausible. |
 | `MING_FR_TN` | on | French text normalization for MULTILINGUAL with language `fr`: spells out numbers, times and amounts, and flattens French typography. |
+| `MING_LANG_DETECT` | `auto` | Language detection for tasks other than MULTILINGUAL. `auto`: French, German, Spanish, Japanese or Korean text takes the MULTILINGUAL text path, and TTS, BASIC and EMOTION also get the `Target language:` prompt line. `text`: the text path only. `prompt`: the line for every task except DIALECT. `0`: off, as upstream. |
 | `MING_JOIN` | on | Join text fragments with pauses by boundary (see [Long text](#long-text)). `0` concatenates them as upstream does. |
 | `MING_CLEAR_CACHE` | on | Free MLX's buffer cache after each fragment of a multi-fragment text. Output is unchanged; `0` keeps the cache, which grows with the text. |
 | `MING_PROFILE` | off | Any value prints per-step timing and step budgets to stderr. |
 
-With `MING_FUSED=0`, `MING_PROMPT_NORM=0`, `MING_SOFT_LIMIT=0`, `MING_GUARD=0`, `MING_FR_TN=0` and `MING_JOIN=0`, the engine follows the upstream Ming pipeline op for op.
+With `MING_FUSED=0`, `MING_PROMPT_NORM=0`, `MING_SOFT_LIMIT=0`, `MING_GUARD=0`, `MING_FR_TN=0`, `MING_LANG_DETECT=0` and `MING_JOIN=0`, the engine follows the upstream Ming pipeline op for op.
 
 ## Embed the engine in a Zig program
 

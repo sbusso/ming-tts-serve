@@ -207,7 +207,7 @@ fn worker(st: *State) void {
 
 /// A/B switches for the deliberate departures from upstream ("0" turns one
 /// off): MING_PROMPT_NORM, MING_SOFT_LIMIT, MING_GUARD, MING_FR_TN, MING_JOIN,
-/// MING_CLEAR_CACHE.
+/// MING_CLEAR_CACHE, MING_LANG_DETECT.
 pub fn configure(eng: *ming.Engine) void {
     const off = struct {
         fn f(name: [*:0]const u8) ?bool {
@@ -218,9 +218,17 @@ pub fn configure(eng: *ming.Engine) void {
     if (off("MING_PROMPT_NORM")) |x| eng.normalize_prompt = !x;
     if (off("MING_SOFT_LIMIT")) |x| eng.soft_limit = !x;
     if (off("MING_GUARD")) |x| eng.guard = !x;
-    if (off("MING_FR_TN")) |x| ming.text.french_frontend = !x;
     if (off("MING_JOIN")) |x| eng.join = !x;
     if (off("MING_CLEAR_CACHE")) |x| eng.clear_cache = !x;
+    configureText();
+}
+
+/// The text-only switches (also read by `ming-tts frontend`, which loads no
+/// engine): MING_FR_TN, and MING_LANG_DETECT ("0", "text" or "prompt").
+pub fn configureText() void {
+    if (std.c.getenv("MING_FR_TN")) |v| ming.text.french_frontend = !std.mem.eql(u8, std.mem.span(v), "0");
+    if (std.c.getenv("MING_LANG_DETECT")) |v| ming.text.detect_language = std.meta.stringToEnum(ming.text.DetectLanguage, std.mem.span(v)) orelse
+        if (std.mem.eql(u8, std.mem.span(v), "0")) .off else ming.text.detect_language;
 }
 
 /// Run one clone on `samples` so the prompt path (resampler, CAM++, VAE
