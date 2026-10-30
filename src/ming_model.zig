@@ -18,7 +18,9 @@
 //! Every op mirrors the Python graph (same op order, same weak-scalar dtypes,
 //! `addmm` for biased linears), so fp32-on-CPU runs match the Python MLX engine
 //! to rounding and bf16 runs stay within bf16 noise. `src/ming_parity.zig`
-//! holds the check.
+//! holds the check. On the GPU in bf16, the DiT stacks and the LM decode step
+//! run on fused kernels instead (`ming_fused.zig`, same rounding points, not
+//! bit-exact); MING_FUSED=0 restores the mirrored graph.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");

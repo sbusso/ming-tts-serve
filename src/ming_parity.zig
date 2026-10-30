@@ -6,6 +6,7 @@
 //! the CPU stream, bf16 = shipped dtypes on the GPU). Each module is fed the
 //! reference input of that module, so errors do not compound, except in the
 //! free-running rows. Exit status is non-zero when a gated row fails.
+//! MING_PARITY_STEPS=1 also prints the free run's z diff for steps 0-5.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");

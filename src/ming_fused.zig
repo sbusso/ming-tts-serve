@@ -1,4 +1,5 @@
-//! Fused Metal kernels for Ming's DiT stacks (CFM flow head + aggregator).
+//! Fused Metal kernels for Ming's per-step decode: the DiT stacks (CFM flow
+//! head, aggregator) and the Qwen2 LM's one-token step.
 //!
 //! The DiT runs on 6 rows (CFG batch 2 × seq 3) or 2 rows (aggregator), so
 //! every linear is a bandwidth-bound GEMV. One DiT block becomes 4 dispatches
@@ -10,21 +11,26 @@
 //!   D  ff2 linear + bias + residual
 //!
 //! plus, per Euler step of the CFM, E (x embedder + input row assembly) and
-//! F (final norm + linear on the last row + CFG combine + Euler update).
+//! F (final norm + linear on the last row + CFG combine + Euler update). The
+//! LM step is 5 dispatches per layer (see "Qwen2 LM decode" below).
 //!
 //! Storage is bf16, accumulation f32, and every value MLX rounds to bf16 is
-//! rounded here at the same point (linear outputs, rotary, attention output,
-//! each op of the gelu chain, each op of the CFG/Euler update). What differs
-//! from MLX: f32 summation order inside the dot products, the rmsnorm sum of
-//! squares, and the softmax (two-pass instead of MLX's online one), and
-//! gelu's x**3 is x*x*x instead of pow(x, 3). All are f32-level; outputs move
-//! by at most bf16 rounding flips. MING_FUSED=0 restores the MLX graph.
+//! rounded here at the same point (linear outputs, rotary/rope, attention
+//! output, each op of the gelu chain and of the CFG/Euler update). What
+//! differs from MLX: rmsnorm is folded into the GEMV (1/rms applied to the
+//! f32 dot product instead of rounding the normed row to bf16 first), f32
+//! summation order, a two-pass softmax instead of MLX's online one, gelu's
+//! x**3 as x*x*x, and swiglu's sigmoid rounded once. All are below the bf16
+//! rounding of the outputs; a whole CFM sample moves by ~1e-2 relative.
+//! MING_FUSED=0 restores the MLX graph bit for bit.
 //!
-//! GEMV layout (A–D): a threadgroup of 4 simdgroups owns 8 output columns for
-//! all R rows; the 4 simdgroups split K, lanes read 4 consecutive bf16 per
-//! 128-wide block (one 8-byte load per weight row), and partial sums meet in
-//! threadgroup memory. The rows a kernel multiplies (normed x, attention
-//! output) sit in threadgroup memory as f32, so R is capped at 6 (24 KB).
+//! GEMV layout: a threadgroup of SG simdgroups owns NO output columns for all
+//! R rows; the simdgroups take 128-wide blocks of K round robin, lanes read 4
+//! consecutive bf16 per block (one 8-byte load per weight row), and partial
+//! sums meet in threadgroup memory. R is capped at 6 (B's attention output in
+//! threadgroup memory, and register pressure). Tiles were tuned on an M5 Max
+//! with dependent-dispatch chains (`ming-fused-bench`); MING_FT_<kernel>=NO,SG
+//! overrides them for re-tuning.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -32,9 +38,9 @@ const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
 const S = mlx.mlx_stream;
 
-pub const D = 1024;
-pub const FF = 4096;
-pub const MAX_ROWS = 6;
+const D = 1024;
+const FF = 4096;
+const MAX_ROWS = 6;
 /// GEMV tile: output columns per threadgroup, simdgroups per threadgroup
 /// (they split K).
 const Tile = struct { no: c_int, sg: c_int };
