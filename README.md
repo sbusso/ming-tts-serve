@@ -13,52 +13,24 @@ It provides:
 
 All Ming tasks are supported: TTS, voice cloning, MULTILINGUAL, BASIC, EMOTION, DIALECT, IP (built-in voices), FREEFORM and VOICE_DESIGN.
 
-## Install from a release
+## Install
 
-A release is a prebuilt `ming-tts` binary with the MLX runtime. It needs a Mac with Apple silicon and macOS 26.2 or later, but no Xcode, Zig or CMake. To build it yourself instead, see [Build from source](#build-from-source).
+On a Mac with Apple silicon and macOS 26.2 or later:
 
-1. Download and check the tarball from the [releases page](https://github.com/sbusso/ming-tts-serve/releases/latest). Set `VERSION` to the release you want, without the leading `v`:
+```sh
+curl -fsSL https://raw.githubusercontent.com/sbusso/ming-tts-serve/main/install.sh | sh
+```
 
-   ```sh
-   VERSION=0.1.0
-   NAME=ming-tts-serve-$VERSION-macos-arm64
-   curl -fLO https://github.com/sbusso/ming-tts-serve/releases/download/v$VERSION/$NAME.tar.gz
-   curl -fLO https://github.com/sbusso/ming-tts-serve/releases/download/v$VERSION/$NAME.tar.gz.sha256
-   shasum -a 256 -c $NAME.tar.gz.sha256
-   ```
+The script installs the latest release in `~/.local/share/ming-tts-serve`, adds the `ming-tts` command to `~/.local/bin`, and downloads the model (about 3 GB) when [uv](https://docs.astral.sh/uv/) is installed. Then:
 
-2. Extract it anywhere. The folder holds `bin/ming-tts`, the MLX libraries in `lib/`, and the docs. Keep `bin/` and `lib/` together; the binary finds the libraries through a path relative to itself.
+```sh
+ming-tts say --out hello.wav --json '{"task":"IP","voice":"UK_George","text":"Hello from Ming."}'
+afplay hello.wav
+```
 
-   ```sh
-   tar -xzf $NAME.tar.gz
-   cd $NAME
-   ```
+Options, set before `sh`: `MING_VERSION=0.1.0` installs a given release, `MING_NO_MODEL=1` skips the model download, and `MING_PREFIX` and `MING_BIN_DIR` change the install folders. To install by hand, download a tarball from the [releases page](https://github.com/sbusso/ming-tts-serve/releases/latest) and read [install.sh](install.sh).
 
-   If you downloaded the tarball with a browser, macOS marks the files as quarantined and refuses to run them. Clear the mark:
-
-   ```sh
-   xattr -dr com.apple.quarantine .
-   ```
-
-   The binaries are ad-hoc signed, not notarized by Apple. Notarization is planned for a later release.
-
-3. Download the model (about 3 GB) with [uv](https://docs.astral.sh/uv/):
-
-   ```sh
-   uvx --from huggingface_hub hf download inclusionAI/Ming-3.0-tts-0.5b --local-dir models/Ming-3.0-tts-0.5b
-   ```
-
-4. Make your first audio:
-
-   ```sh
-   bin/ming-tts say --out hello.wav \
-     --json '{"task":"IP","voice":"UK_George","text":"Hello from Ming."}'
-   afplay hello.wav
-   ```
-
-   `ming-tts` looks for the model in `models/Ming-3.0-tts-0.5b` under the current directory. From another directory, pass `--model DIR` or set `MING_MODEL_DIR`.
-
-The rest of this README uses `zig-out/bin/ming-tts`, the path of a source build. With a release, use `bin/ming-tts` instead.
+The rest of this README uses `zig-out/bin/ming-tts`, the path of a source build. After the script install, use `ming-tts` instead.
 
 ## Build from source
 
