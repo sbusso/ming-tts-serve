@@ -256,6 +256,13 @@ pub fn own(x: Arr) !Arr {
     return o;
 }
 
+pub fn asyncEvalAll(xs: []const Arr) !void {
+    const v = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(v);
+    for (xs) |x| _ = mlx.mlx_vector_array_append_value(v, x);
+    try mlx.check(mlx.mlx_async_eval(v));
+}
+
 pub fn evalAll(xs: []const Arr) !void {
     const v = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(v);
@@ -547,18 +554,36 @@ const DitBlock = struct {
 /// length from the checkpoint's `inv_freq` exactly as `RotaryEmbedding` does.
 const Rotary = struct {
     inv_freq: Arr,
+    /// cos/sin [1, 1, L, D/2] for the one length each stack runs at (DiT 3,
+    /// aggregator 2), built once at load instead of in every compiled step.
+    tab_len: c_int = 0,
+    tab: [2]Arr = undefined,
 
-    fn apply(r: Rotary, g: *G, x: Arr) !Arr {
-        // x: [B, H, L, D]
-        const sh = mlx.getShape(x);
-        const L = sh[2];
+    fn table(r: Rotary, g: *G, L: c_int) ![2]Arr {
+        if (L == r.tab_len) return r.tab;
         var pa = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_arange(&pa, 0, @floatFromInt(L), 1, mlx.mlx_array_dtype(r.inv_freq), g.s));
         const pos = try g.keep(pa);
         // outer(pos, inv) = pos[:, None] * inv[None, :]
         const freqs = try g.mul(try g.reshape(pos, &.{ L, 1 }), try g.reshape(r.inv_freq, &.{ 1, -1 }));
-        const c = try g.reshape(try g.cos(freqs), &.{ 1, 1, L, -1 });
-        const s = try g.reshape(try g.sin(freqs), &.{ 1, 1, L, -1 });
+        return .{ try g.reshape(try g.cos(freqs), &.{ 1, 1, L, -1 }), try g.reshape(try g.sin(freqs), &.{ 1, 1, L, -1 }) };
+    }
+
+    fn precompute(r: *Rotary, a: std.mem.Allocator, s: S, L: c_int) !void {
+        var g = G.init(a, s);
+        defer g.deinit();
+        const t = try r.table(&g, L);
+        try evalAll(&t);
+        r.tab = .{ try own(t[0]), try own(t[1]) };
+        r.tab_len = L;
+    }
+
+    fn apply(r: Rotary, g: *G, x: Arr) !Arr {
+        // x: [B, H, L, D]
+        const sh = mlx.getShape(x);
+        const t = try r.table(g, sh[2]);
+        const c = t[0];
+        const s = t[1];
         const D: c_int = sh[3];
         const xe = try g.sliceAxis(x, 3, 0, D, 2);
         const xo = try g.sliceAxis(x, 3, 1, D, 2);
@@ -573,7 +598,7 @@ const DitStack = struct {
     blocks: []DitBlock,
     rot: Rotary,
 
-    fn load(t: *Tensors, a: std.mem.Allocator, s: S, comptime prefix: []const u8, n: usize) !DitStack {
+    fn load(t: *Tensors, a: std.mem.Allocator, s: S, comptime prefix: []const u8, n: usize, seq_len: c_int) !DitStack {
         const blocks = try a.alloc(DitBlock, n);
         for (blocks, 0..) |*b, i| {
             b.* = .{
@@ -587,7 +612,10 @@ const DitStack = struct {
                 .ff2 = try t.lin(s, prefix ++ ".blocks.{d}.mlp.ff.2", .{i}),
             };
         }
-        return .{ .blocks = blocks, .rot = .{ .inv_freq = try t.get(prefix ++ ".rotary_embed.inv_freq", .{}) } };
+        var rot: Rotary = .{ .inv_freq = try t.get(prefix ++ ".rotary_embed.inv_freq", .{}) };
+        try rot.precompute(a, s, seq_len);
+        try t.extra.appendSlice(t.a, &rot.tab);
+        return .{ .blocks = blocks, .rot = rot };
     }
 
     fn forward(st: *const DitStack, g: *G, x_in: Arr) !Arr {
@@ -727,6 +755,10 @@ pub const Model = struct {
     agg_compiled: ?mlx.mlx_closure = null,
     /// SinusPositionEmbedding frequencies: exp(arange(128, f32) * -log(1e4)/127).
     t_freq: Arr,
+    /// Timestep embeddings for the 10 Euler steps in `t_emb_dt`: they depend
+    /// only on the fixed schedule, so they are built once, not every LM step.
+    t_emb: [FLOW_STEPS]Arr,
+    t_emb_dt: Dtype,
 
     pub fn load(a: std.mem.Allocator, s: S, model_dir: []const u8, opts: Options) !*Model {
         const path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{model_dir});
@@ -748,7 +780,7 @@ pub const Model = struct {
         m.stop_head = try t.lin(s, "stop_head", .{});
         m.spk_head = try t.lin(s, "spk_head", .{});
         const F = "flowloss.cfm.model";
-        m.dit = try DitStack.load(t, a, s, F, 8);
+        m.dit = try DitStack.load(t, a, s, F, 8, 3); // [y, hist, x]
         m.t_mlp0 = try t.lin(s, F ++ ".t_embedder.time_mlp.0", .{});
         m.t_mlp2 = try t.lin(s, F ++ ".t_embedder.time_mlp.2", .{});
         m.x_emb = try t.lin(s, F ++ ".x_embedder", .{});
@@ -756,7 +788,7 @@ pub const Model = struct {
         m.dit_final_norm = try t.get(F ++ ".final_layer.norm_final.weight", .{});
         m.dit_final = try t.lin(s, F ++ ".final_layer.linear", .{});
         const A = "linear_proj_audio";
-        m.agg = try DitStack.load(t, a, s, A, 8);
+        m.agg = try DitStack.load(t, a, s, A, 8, 2); // [cls, x]
         m.agg_x_emb = try t.lin(s, A ++ ".x_embedder", .{});
         m.agg_cls = try t.get(A ++ ".word_embedder.weight", .{});
         m.agg_final_norm = try t.get(A ++ ".final_layer.norm_final.weight", .{});
@@ -779,6 +811,17 @@ pub const Model = struct {
             const f = try g.exp(try g.mul(try g.keep(ar), try g.scalar(-e, .float32)));
             m.t_freq = try own(f);
             try t.extra.append(a, m.t_freq);
+        }
+        {
+            var g = G.init(a, s);
+            defer g.deinit();
+            m.t_emb_dt = m.dtype;
+            const ts = try flowSchedule(&g, m.dtype);
+            for (&m.t_emb, 1..) |*e, i| {
+                e.* = try own(try m.timestepEmbed(&g, try g.reshape(try g.sliceAxis(ts, 0, @intCast(i - 1), @intCast(i), 1), &.{}), m.dtype));
+                try t.extra.append(a, e.*);
+            }
+            try evalAll(&m.t_emb);
         }
         var w32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&w32, try t.get("audio.decoder.head.istft.window", .{}), .float32, s));
@@ -844,21 +887,28 @@ pub const Model = struct {
     /// DiT.forward_with_cfg: x [1,1,64], t scalar (solver dtype), c [1,1,896],
     /// hist [1,1,64] → [2, 1, 64] (cond, uncond).
     pub fn ditCfg(m: *Model, g: *G, x1: Arr, t: Arr, c1: Arr, hist1: Arr) !Arr {
-        const x = try g.concat(&.{ x1, x1 }, 0);
-        const hist = try g.concat(&.{ hist1, hist1 }, 0);
-        const c = try g.concat(&.{ c1, try g.zeros(mlx.getShape(c1), mlx.mlx_array_dtype(c1)) }, 0);
-        const xdt = mlx.mlx_array_dtype(x);
+        return m.ditCfgEmb(g, x1, try m.timestepEmbed(g, t, mlx.mlx_array_dtype(x1)), c1, hist1);
+    }
+
+    /// TimestepEmbedder for scalar t (solver dtype) → [2, 1, 1024] in `xdt`.
+    fn timestepEmbed(m: *Model, g: *G, t: Arr, xdt: Dtype) !Arr {
         var tt = mlx.mlx_array_new();
         const two = [_]c_int{2};
         try mlx.check(mlx.mlx_full(&tt, &two, 1, t, xdt, g.s));
         const tb = try g.keep(tt);
-        // TimestepEmbedder: sinusoid in f32 (x * 1000 rounds in t's dtype first).
+        // Sinusoid in f32 (x * 1000 rounds in t's dtype first).
         const ts = try g.mul(try g.scalar(1000.0, xdt), tb);
         const emb = try g.mul(try g.reshape(ts, &.{ 2, 1 }), try g.reshape(m.t_freq, &.{ 1, 128 }));
         const sincos = try g.astype(try g.concat(&.{ try g.sin(emb), try g.cos(emb) }, -1), xdt);
         var te = try m.t_mlp0.f(g, sincos);
         te = try m.t_mlp2.f(g, try compiledAct(g, .silu, &.{te}));
-        const t_embed = try g.reshape(te, &.{ 2, 1, DIT_HIDDEN });
+        return g.reshape(te, &.{ 2, 1, DIT_HIDDEN });
+    }
+
+    fn ditCfgEmb(m: *Model, g: *G, x1: Arr, t_embed: Arr, c1: Arr, hist1: Arr) !Arr {
+        const x = try g.concat(&.{ x1, x1 }, 0);
+        const hist = try g.concat(&.{ hist1, hist1 }, 0);
+        const c = try g.concat(&.{ c1, try g.zeros(mlx.getShape(c1), mlx.mlx_array_dtype(c1)) }, 0);
         const x_now = try m.x_emb.f(g, x);
         const x_hist = try m.x_emb.f(g, hist);
         const c_embed = try m.c_emb.f(g, c);
@@ -940,20 +990,17 @@ pub const Model = struct {
     /// noise dtype. `noise` [1,1,64], `sde` [10,1,1,64].
     pub fn cfmSampleRaw(m: *Model, g: *G, z: Arr, hist: Arr, noise: Arr, sde: Arr, cfg: f32, sigma: f32, temperature: f32) !Arr {
         const dt = mlx.mlx_array_dtype(noise);
-        const sched = [_]f32{ 0, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32 };
-        // t = (1/32) * array(sched, dt); t = t + (-1) * (cos(pi/2 * t) - 1 + t)
-        var t = try g.astype(try g.fromF32(&sched, &.{11}), dt);
-        t = try g.mul(try g.scalar(1.0 / 32.0, dt), t);
-        const ct = try g.cos(try g.mul(try g.scalar(std.math.pi / 2.0, dt), t));
-        const sw = try g.add(try g.sub(ct, try g.scalar(1, dt)), t);
-        t = try g.add(t, try g.mul(try g.scalar(-1, dt), sw));
+        const t = try flowSchedule(g, dt);
         var y = noise;
         const shift_k = sigma * std.math.sqrt(temperature);
-        for (1..sched.len) |i| {
+        for (1..FLOW_STEPS + 1) |i| {
             const t0 = try g.reshape(try g.sliceAxis(t, 0, @intCast(i - 1), @intCast(i), 1), &.{});
             const t1 = try g.reshape(try g.sliceAxis(t, 0, @intCast(i), @intCast(i + 1), 1), &.{});
             const dtt = try g.sub(t1, t0);
-            const out = try m.ditCfg(g, y, t0, z, hist);
+            const out = if (dt == m.t_emb_dt)
+                try m.ditCfgEmb(g, y, m.t_emb[i - 1], z, hist)
+            else
+                try m.ditCfg(g, y, t0, z, hist);
             const pn = try g.split2(out, 0);
             const cfg_a = try g.scalar(cfg, mlx.mlx_array_dtype(out));
             var f0 = try g.add(pn[0], try g.mul(try g.sub(pn[0], pn[1]), cfg_a));
@@ -966,6 +1013,18 @@ pub const Model = struct {
             }
         }
         return y;
+    }
+
+    /// EPSS + sway schedule, [FLOW_STEPS + 1] in `dt`:
+    /// t = (1/32) * array(sched, dt); t = t + (-1) * (cos(pi/2 * t) - 1 + t)
+    fn flowSchedule(g: *G, dt: Dtype) !Arr {
+        const sched = [_]f32{ 0, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32 };
+        comptime std.debug.assert(sched.len == FLOW_STEPS + 1);
+        var t = try g.astype(try g.fromF32(&sched, &.{sched.len}), dt);
+        t = try g.mul(try g.scalar(1.0 / 32.0, dt), t);
+        const ct = try g.cos(try g.mul(try g.scalar(std.math.pi / 2.0, dt), t));
+        const sw = try g.add(try g.sub(ct, try g.scalar(1, dt)), t);
+        return g.add(t, try g.mul(try g.scalar(-1, dt), sw));
     }
 
     // ── VAE ──
@@ -1153,8 +1212,6 @@ pub fn sampleLatents(m: *Model, embeds_in: Arr, prompt_latent: ?Arr, p: SamplePa
         for (latents.items) |x| _ = mlx.mlx_array_free(x);
         latents.deinit(a);
     }
-    var embeds = try own(embeds_in);
-    defer _ = mlx.mlx_array_free(embeds);
     var history: Arr = .{ .ctx = null };
     defer if (history.ctx != null) {
         _ = mlx.mlx_array_free(history);
@@ -1164,45 +1221,71 @@ pub fn sampleLatents(m: *Model, embeds_in: Arr, prompt_latent: ?Arr, p: SamplePa
     var build_ns: u64 = 0;
     var eval_ns: u64 = 0;
     defer if (prof) std.debug.print("[ming] {d} steps: graph build {d:.2} ms/step, eval {d:.2} ms/step\n", .{ latents.items.len, @as(f64, @floatFromInt(build_ns)) / 1e6 / @as(f64, @floatFromInt(@max(latents.items.len, 1))), @as(f64, @floatFromInt(eval_ns)) / 1e6 / @as(f64, @floatFromInt(@max(latents.items.len, 1))) });
+    // Pipelined one step ahead: each iteration queues CFM for step k plus the
+    // LM pass for k+1, then reads stop_k (queued one iteration earlier), so the
+    // GPU never idles while the CPU encodes. The only waste is one LM pass after
+    // the last step. Noise is drawn only for steps that run, so the RNG stream
+    // and the output match the serial loop bit for bit.
+    var z: Arr = undefined;
+    var stop: Arr = undefined;
+    var zdt: Dtype = undefined;
+    {
+        var g = G.init(a, m.s);
+        defer g.deinit();
+        const t_build = std.Io.Timestamp.now(io_t, .awake);
+        const hidden = try m.lmForward(&g, embeds_in, &cache);
+        const Lh = mlx.getShape(hidden)[1];
+        const z0 = try g.sliceAxis(hidden, 1, Lh - 1, Lh, 1);
+        zdt = mlx.mlx_array_dtype(z0);
+        var h = try g.zeros(&.{ 1, 1, LATENT }, zdt);
+        if (prompt_latent) |pl_in| {
+            // history_patch_size 1: the prompt's last latent seeds the history.
+            const pl = try g.astype(pl_in, zdt);
+            const T = mlx.getShape(pl)[1];
+            h = try g.sliceAxis(pl, 1, T - 1, T, 1);
+        }
+        history = try own(h);
+        z = try own(z0);
+        stop = try own(try m.stopProb(&g, z0));
+        build_ns += @intCast(t_build.untilNow(io_t, .awake).nanoseconds);
+        try asyncEvalAll(&.{ z, stop });
+    }
+    defer {
+        _ = mlx.mlx_array_free(z);
+        _ = mlx.mlx_array_free(stop);
+    }
     for (0..steps) |step| {
         var g = G.init(a, m.s);
         defer g.deinit();
         const t_build = std.Io.Timestamp.now(io_t, .awake);
-        const hidden = try m.lmForward(&g, embeds, &cache);
-        const Lh = mlx.getShape(hidden)[1];
-        const z = try g.sliceAxis(hidden, 1, Lh - 1, Lh, 1);
-        const zdt = mlx.mlx_array_dtype(z);
-        if (step == 0) {
-            var h = try g.zeros(&.{ 1, 1, LATENT }, zdt);
-            if (prompt_latent) |pl_in| {
-                // history_patch_size 1: the prompt's last latent seeds the history.
-                const pl = try g.astype(pl_in, zdt);
-                const T = mlx.getShape(pl)[1];
-                h = try g.sliceAxis(pl, 1, T - 1, T, 1);
-            }
-            history = try own(h);
-        }
         const nz = try noise.draw(&g, step, zdt);
         const latent = try m.cfmSample(&g, z, history, nz[0], nz[1], p.cfg, p.sigma, p.temperature);
-        const stop = try m.stopProb(&g, z);
+        var z_next: ?Arr = null;
+        var stop_next: Arr = undefined;
+        if (step + 1 < steps) {
+            const hidden = try m.lmForward(&g, try m.aggregate(&g, latent), &cache);
+            z_next = hidden; // [1, 1, 896]: one new position
+            stop_next = try m.stopProb(&g, hidden);
+            try asyncEvalAll(&.{ latent, hidden, stop_next });
+        } else try asyncEvalAll(&.{latent});
         const t_eval = std.Io.Timestamp.now(io_t, .awake);
         build_ns += @intCast(t_build.durationTo(t_eval).nanoseconds);
-        try evalAll(&.{ latent, stop });
-        eval_ns += @intCast(t_eval.untilNow(io_t, .awake).nanoseconds);
         const sp = try itemF32(stop, m.s);
+        eval_ns += @intCast(t_eval.untilNow(io_t, .awake).nanoseconds);
         if (trace) |t| {
             try t.z.append(a, try own(z));
             try t.stop.append(a, sp);
         }
         try latents.append(a, try own(latent));
         if (sp > 0.5 and step > 3) break;
-        // Left lazy: they evaluate with the next step's graph, as in Python.
-        const next = try m.aggregate(&g, latent);
         const nh = try g.concat(&.{ try g.sliceAxis(history, 1, 1, 1, 1), latent }, 1);
-        _ = mlx.mlx_array_free(embeds);
-        embeds = try own(next);
         _ = mlx.mlx_array_free(history);
         history = try own(nh);
+        const zn = z_next orelse break;
+        _ = mlx.mlx_array_free(z);
+        z = try own(zn);
+        _ = mlx.mlx_array_free(stop);
+        stop = try own(stop_next);
     }
     var g = G.init(a, m.s);
     defer g.deinit();

@@ -77,6 +77,9 @@ pub const Engine = struct {
     model: *model.Model,
     tok: tokenizer_mod.Tokenizer,
     speaker: *campplus.Campplus,
+    /// Last CAM++ embedding, keyed by a hash of the 16 kHz input: the app
+    /// reuses one reference for many takes, and CAM++ costs ~90 ms on the CPU.
+    spk_cache: ?struct { key: u64, emb: []f32 } = null,
 
     pub fn init(io: std.Io, a: std.mem.Allocator, s: model.S, model_dir: []const u8, opts: model.Options) !Engine {
         const m = try model.Model.load(a, s, model_dir, opts);
@@ -93,6 +96,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.spk_cache) |c| e.a.free(c.emb);
         e.speaker.deinit();
         e.tok.deinit();
         e.model.deinit();
@@ -190,7 +194,7 @@ pub const Engine = struct {
                 const w16 = try audio.resample(a, loaded.pcm, loaded.sample_rate, 16000);
                 defer a.free(w16);
                 if (prof) lap(e.io, &t, "resample 16k");
-                spk = try e.speaker.embed(a, w16);
+                spk = try e.speakerEmbed(w16);
                 if (prof) lap(e.io, &t, "CAM++");
             }
             const w44 = try audio.resample(a, loaded.pcm, loaded.sample_rate, SAMPLE_RATE);
@@ -316,6 +320,19 @@ pub const Engine = struct {
         const lat = try model.sampleLatents(e.model, built.embeds, pl, .{ .max_steps = max_steps, .cfg = req.cfg, .sigma = req.sigma, .temperature = req.temperature }, .rng, null);
         _ = try g.keep(lat);
         return e.model.vaeDecode(&g, lat);
+    }
+
+    /// CAM++ embedding of 16 kHz audio (owned), from the one-entry cache when
+    /// the samples match the last call.
+    fn speakerEmbed(e: *Engine, w16: []const f32) ![]f32 {
+        const key = std.hash.Wyhash.hash(w16.len, std.mem.sliceAsBytes(w16));
+        if (e.spk_cache) |c| if (c.key == key) return e.a.dupe(f32, c.emb);
+        const emb = try e.speaker.embed(e.a, w16);
+        errdefer e.a.free(emb);
+        const keep = try e.a.dupe(f32, emb);
+        if (e.spk_cache) |c| e.a.free(c.emb);
+        e.spk_cache = .{ .key = key, .emb = keep };
+        return emb;
     }
 
     /// pad_prompt + encode_prompt_latent: 44.1 kHz audio → latents [1, T, 64] (owned).
