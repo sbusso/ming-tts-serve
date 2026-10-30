@@ -1,8 +1,8 @@
-//! Minimal WAV (RIFF/WAVE) encoder for the native audio-generation path.
+//! Minimal WAV (RIFF/WAVE) encoder and decoder.
 //!
-//! TTS produces a mono float waveform in [-1, 1] at a model sample rate (24 kHz
-//! for Qwen3-TTS). We serialize it as a standard 16-bit PCM WAV — the most
-//! widely compatible container, and all the app needs to play it back. Float
+//! TTS produces a mono float waveform in [-1, 1] at the model sample rate
+//! (44.1 kHz for Ming-3.0-tts). It is written as standard 16-bit PCM WAV, the
+//! most widely compatible container. Float
 //! equivalence against the Python reference is checked on the raw samples (the
 //! `.npy` oracle), not on these quantized bytes, so 16-bit PCM here is fine.
 //!
@@ -79,8 +79,7 @@ pub fn encodePcm16(
 }
 
 /// A decoded WAV: interleaved f32 samples in [-1, 1] plus the file's real
-/// format metadata (unlike the legacy mono-PCM16 fast path in gen.zig, which
-/// assumes the app pre-normalized the clip).
+/// format metadata.
 pub const Decoded = struct {
     pcm: []f32,
     channels: u16,

@@ -2706,55 +2706,6 @@ test "decoderHasByteFallback: Sequence containing ByteFallback, bare ByteFallbac
     try testing.expect(!decoderHasByteFallback(bl.value));
 }
 
-test "byte_fallback: real Laya tokenizer matches HF `tokenizers` on out-of-vocab scripts (LAYA_TEST_MODEL)" {
-    // tests/fixtures/laya/tokenizer_cases.json is dumped by
-    // tests/dump_laya_fixtures.py from the Python `tokenizers` library.
-    const model = std.c.getenv("LAYA_TEST_MODEL") orelse return error.SkipZigTest;
-    const fx = std.c.getenv("LAYA_FIXTURES") orelse return error.SkipZigTest;
-    const allocator = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{std.mem.span(model)});
-    defer allocator.free(tok_dir);
-    var tok = try loadTokenizer(io, allocator, tok_dir);
-    defer tok.deinit();
-    try testing.expect(tok.byte_fallback);
-    try testing.expect(tok.byte_fallback_decode);
-
-    const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_cases.json", .{std.mem.span(fx)});
-    defer allocator.free(path);
-    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer f.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = f.reader(io, &rb);
-    const text = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
-    defer allocator.free(text);
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
-    defer parsed.deinit();
-
-    var byte_cases: usize = 0;
-    for (parsed.value.array.items) |c| {
-        const name = c.object.get("name").?.string;
-        const input = c.object.get("text").?.string;
-        const want = c.object.get("ids").?.array.items;
-        const ids = try tok.encode(allocator, input);
-        defer allocator.free(ids);
-        var same = ids.len == want.len;
-        if (same) for (ids, want) |g, w| {
-            if (g != @as(u32, @intCast(w.integer))) same = false;
-        };
-        if (!same) {
-            std.debug.print("\n[byte-fallback] {s}: got {any}\n                want {any}\n", .{ name, ids, want });
-            return error.TokenizationMismatch;
-        }
-        if (c.object.get("byte_tokens").?.integer > 0) byte_cases += 1;
-        const decoded = try tok.decode(allocator, ids, false);
-        defer allocator.free(decoded);
-        try testing.expectEqualStrings(c.object.get("decoded").?.string, decoded);
-    }
-    try testing.expect(byte_cases >= 3);
-    std.debug.print("\n[byte-fallback] {d} cases match HF tokenizers ({d} exercise byte tokens)\n", .{ parsed.value.array.items.len, byte_cases });
-}
-
 test "parseMergePair handles both array and space-joined-string formats" {
     const alloc = testing.allocator;
     // Array format (Qwen3 / Gemma 4): ["left","right"].

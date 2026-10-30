@@ -6,5 +6,4 @@ test {
     _ = @import("mlx.zig");
     _ = @import("tokenizer.zig");
     _ = @import("wav.zig");
-    _ = @import("log.zig");
 }

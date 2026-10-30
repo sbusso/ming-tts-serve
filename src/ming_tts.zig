@@ -77,8 +77,8 @@ pub const Engine = struct {
     model: *model.Model,
     tok: tokenizer_mod.Tokenizer,
     speaker: *campplus.Campplus,
-    /// Last CAM++ embedding, keyed by a hash of the 16 kHz input: the app
-    /// reuses one reference for many takes, and CAM++ costs ~90 ms on the CPU.
+    /// Last CAM++ embedding, keyed by a hash of the 16 kHz input: a client
+    /// often reuses one reference for many takes, and CAM++ costs ~90 ms on the CPU.
     spk_cache: ?struct { key: u64, emb: []f32 } = null,
 
     pub fn init(io: std.Io, a: std.mem.Allocator, s: model.S, model_dir: []const u8, opts: model.Options) !Engine {

@@ -267,7 +267,7 @@ The last argument can be replaced with `MING_REF_WAV`. Use `f32` instead of `bf1
 | `src/ming_audio.zig`, `src/ming_campplus.zig` | Audio I/O and resampling, CAM++ speaker embedding. |
 | `src/ming_service.zig` | In-process API service (the `ming` module root). |
 | `src/ming_main.zig` | `ming-tts` server and CLI. |
-| `src/mlx.zig`, `src/tokenizer.zig`, `src/wav.zig`, `src/log.zig`, `src/io_util.zig` | Helpers shared with mlx-serve. |
+| `src/mlx.zig`, `src/tokenizer.zig`, `src/wav.zig`, `src/log.zig`, `src/io_util.zig` | MLX bindings, tokenizer, WAV and logging helpers, adapted from mlx-serve. |
 | `scripts/build-mlx.sh`, `patches/` | MLX and mlx-c build. |
 
 ## Credits
