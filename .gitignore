@@ -3,3 +3,4 @@ zig-out/
 lib/mlx
 lib/.mlx-build/
 models/
+dist/
