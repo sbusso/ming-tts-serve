@@ -349,6 +349,85 @@ pub const Tensors = struct {
         return self;
     }
 
+    /// The initializers of an ONNX model (`graph.initializer`), keyed by name,
+    /// as f32/i64 arrays: what mlx-audio's ONNX-to-safetensors conversion
+    /// writes, read directly so no converted file is needed. Handles raw_data
+    /// and packed float_data/int64_data; external data is not supported.
+    pub fn loadOnnx(a: std.mem.Allocator, io: std.Io, path: []const u8, cast_to: ?Dtype, s: S) !Tensors {
+        const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer file.close(io);
+        var rb: [64 * 1024]u8 = undefined;
+        var rs = file.reader(io, &rb);
+        const bytes = try rs.interface.allocRemaining(a, .limited(1 << 30));
+        defer a.free(bytes);
+        var self: Tensors = .{ .map = std.StringHashMap(Arr).init(a), .a = a };
+        errdefer self.deinit();
+        var model_pb = Pb{ .b = bytes };
+        while (try model_pb.next()) |mf| {
+            if (mf.num != 7 or mf.wire != 2) continue; // ModelProto.graph
+            var graph = Pb{ .b = mf.bytes };
+            while (try graph.next()) |gf| {
+                if (gf.num != 5 or gf.wire != 2) continue; // GraphProto.initializer
+                try self.addOnnxTensor(gf.bytes, cast_to, s);
+            }
+        }
+        if (self.map.count() == 0) return error.NoOnnxInitializers;
+        return self;
+    }
+
+    fn addOnnxTensor(self: *Tensors, tensor: []const u8, cast_to: ?Dtype, s: S) !void {
+        var dims: [8]c_int = undefined;
+        var nd: usize = 0;
+        var dtype: u64 = 0;
+        var name: []const u8 = "";
+        var raw: ?[]const u8 = null;
+        var packed_data: ?[]const u8 = null; // float_data (4) or int64_data (7), packed
+        var pb = Pb{ .b = tensor };
+        while (try pb.next()) |f| switch (f.num) {
+            1 => if (f.wire == 0) {
+                if (nd == dims.len) return error.OnnxRank;
+                dims[nd] = @intCast(f.int);
+                nd += 1;
+            } else {
+                var d = Pb{ .b = f.bytes };
+                while (d.pos < d.b.len) {
+                    if (nd == dims.len) return error.OnnxRank;
+                    dims[nd] = @intCast(try d.varint());
+                    nd += 1;
+                }
+            },
+            2 => dtype = f.int,
+            4, 7 => packed_data = f.bytes,
+            8 => name = f.bytes,
+            9 => raw = f.bytes,
+            14 => return error.OnnxExternalData,
+            else => {},
+        };
+        const dt: Dtype, const size: usize = switch (dtype) {
+            1 => .{ .float32, 4 },
+            7 => .{ .int64, 8 },
+            else => return error.OnnxDtype,
+        };
+        var count: usize = 1;
+        for (dims[0..nd]) |d| count *= @intCast(d);
+        const data = raw orelse packed_data orelse return error.OnnxNoData;
+        if (data.len != count * size) return error.OnnxDataSize;
+        // Copy to aligned memory; mlx_array_new_data copies again into its own buffer.
+        const buf = try self.a.alignedAlloc(u8, .@"8", data.len);
+        defer self.a.free(buf);
+        @memcpy(buf, data);
+        var v = mlx.mlx_array_new_data(buf.ptr, &dims, @intCast(nd), dt);
+        if (cast_to) |want| if (dt == .float32 and want != .float32) {
+            var c = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&c, v, want, s));
+            _ = mlx.mlx_array_free(v);
+            v = c;
+        };
+        const k = try self.a.dupe(u8, name);
+        errdefer self.a.free(k);
+        try self.map.put(k, v);
+    }
+
     pub fn deinit(self: *Tensors) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
@@ -1399,3 +1478,45 @@ pub fn sampleLatents(m: *Model, embeds_in: Arr, prompt_latent: ?Arr, p: SamplePa
     defer g.deinit();
     return own(try g.concat(latents.items, 1));
 }
+
+/// Minimal protobuf wire-format reader for `Tensors.loadOnnx`.
+const Pb = struct {
+    b: []const u8,
+    pos: usize = 0,
+
+    const Field = struct { num: u64, wire: u3, int: u64 = 0, bytes: []const u8 = "" };
+
+    fn varint(p: *Pb) !u64 {
+        var v: u64 = 0;
+        var shift: u6 = 0;
+        while (true) {
+            if (p.pos >= p.b.len) return error.OnnxTruncated;
+            const c = p.b[p.pos];
+            p.pos += 1;
+            v |= @as(u64, c & 0x7f) << shift;
+            if (c & 0x80 == 0) return v;
+            if (shift >= 63) return error.OnnxVarint;
+            shift += 7;
+        }
+    }
+
+    fn next(p: *Pb) !?Field {
+        if (p.pos >= p.b.len) return null;
+        const key = try p.varint();
+        var f: Field = .{ .num = key >> 3, .wire = @truncate(key & 7) };
+        switch (f.wire) {
+            0 => f.int = try p.varint(),
+            1 => p.pos += 8,
+            2 => {
+                const n: usize = @intCast(try p.varint());
+                if (p.pos + n > p.b.len) return error.OnnxTruncated;
+                f.bytes = p.b[p.pos .. p.pos + n];
+                p.pos += n;
+            },
+            5 => p.pos += 4,
+            else => return error.OnnxWireType,
+        }
+        if (p.pos > p.b.len) return error.OnnxTruncated;
+        return f;
+    }
+};

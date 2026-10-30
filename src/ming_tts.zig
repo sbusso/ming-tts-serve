@@ -135,12 +135,24 @@ pub const Engine = struct {
         var tok = try tokenizer_mod.loadTokenizerAny(io, a, model_dir);
         errdefer tok.deinit();
         try validateTokenizer(a, &tok);
-        const cp_path = try std.fmt.allocPrint(a, "{s}/campplus.safetensors", .{model_dir});
-        defer a.free(cp_path);
         // CAM++ runs on the CPU stream: Metal fp32 convolutions drift ~3e-3
         // from onnxruntime, enough to change a bf16 clone's trajectory.
-        const sp = try campplus.Campplus.load(a, mlx.mlx_default_cpu_stream_new(), cp_path);
+        // The Hugging Face checkpoint ships campplus.onnx; a campplus.safetensors
+        // (mlx-audio's conversion of it) is used when present.
+        const sp = try loadSpeaker(io, a, model_dir);
         return .{ .a = a, .io = io, .s = s, .model = m, .tok = tok, .speaker = sp };
+    }
+
+    fn loadSpeaker(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !*campplus.Campplus {
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        const st = try std.fmt.allocPrint(a, "{s}/campplus.safetensors", .{model_dir});
+        defer a.free(st);
+        if (std.Io.Dir.accessAbsolute(io, st, .{})) |_| {
+            return campplus.Campplus.load(a, cpu, st);
+        } else |_| {}
+        const onnx = try std.fmt.allocPrint(a, "{s}/campplus.onnx", .{model_dir});
+        defer a.free(onnx);
+        return campplus.Campplus.loadOnnx(io, a, cpu, onnx);
     }
 
     pub fn deinit(e: *Engine) void {
