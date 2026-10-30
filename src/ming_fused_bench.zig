@@ -1,0 +1,234 @@
+//! GPU timing for the fused DiT kernels vs the MLX graph.
+//!
+//!   ming-fused-bench <model_dir> [iters]
+//!   ming-fused-bench spk <model_dir> <ref.wav> <a.wav>...
+//!
+//! `spk` prints, per WAV: CAM++ cosine similarity to ref.wav, duration, RMS
+//! and peak (dBFS), and the count of non-finite samples.
+//!
+//! Times one compiled CFM sample (10 Euler steps × CFG DiT) per iteration
+//! with MING_FUSED on and off, then each fused kernel alone (80 dispatches
+//! per graph, as in one LM step), and prints the max |diff| of the CFM output.
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const ming = @import("ming_model.zig");
+const fused = @import("ming_fused.zig");
+const audio = @import("ming_audio.zig");
+const campplus = @import("ming_campplus.zig");
+
+const Arr = ming.Arr;
+
+fn now(io: std.Io) std.Io.Timestamp {
+    return std.Io.Timestamp.now(io, .awake);
+}
+
+fn ms(io: std.Io, t0: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.untilNow(io, .awake).nanoseconds)) / 1e6;
+}
+
+fn cfm(m: *ming.Model, z: Arr, hist: Arr, noise: Arr, sde: Arr) !Arr {
+    var g = ming.G.init(m.a, m.s);
+    defer g.deinit();
+    const y = try m.cfmSample(&g, z, hist, noise, sde, 2.0, 0.25, 0.0);
+    try ming.evalAll(&.{y});
+    return ming.own(y);
+}
+
+pub fn main(init: std.process.Init) !void {
+    const a = init.gpa;
+    const io = init.io;
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, a);
+    defer it.deinit();
+    _ = it.next();
+    var dir = it.next() orelse return error.Usage;
+    if (std.mem.eql(u8, dir, "spk")) {
+        dir = it.next() orelse return error.Usage;
+        const cp_path = try std.fmt.allocPrint(a, "{s}/campplus.safetensors", .{dir});
+        defer a.free(cp_path);
+        const cp = try campplus.Campplus.load(a, mlx.mlx_default_cpu_stream_new(), cp_path);
+        defer cp.deinit();
+        var ref: ?[]f32 = null;
+        defer if (ref) |r| a.free(r);
+        while (it.next()) |path| {
+            const w = try audio.loadMono(io, a, path);
+            defer a.free(w.pcm);
+            var bad: usize = 0;
+            var ss: f64 = 0;
+            var peak: f32 = 0;
+            for (w.pcm) |v| {
+                if (!std.math.isFinite(v)) {
+                    bad += 1;
+                    continue;
+                }
+                ss += v * v;
+                peak = @max(peak, @abs(v));
+            }
+            const w16 = try audio.resample(a, w.pcm, w.sample_rate, 16000);
+            defer a.free(w16);
+            const e = try cp.embed(a, w16);
+            if (ref == null) {
+                ref = e;
+                continue;
+            }
+            defer a.free(e);
+            var dot: f64 = 0;
+            var na: f64 = 0;
+            var nb: f64 = 0;
+            for (ref.?, e) |x, y| {
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            const n: f64 = @floatFromInt(w.pcm.len);
+            std.debug.print("{s}\tsim {d:.4}\tdur {d:.2}s\trms {d:.1} dBFS\tpeak {d:.1} dBFS\tnonfinite {d}\n", .{
+                path,                                dot / @sqrt(na * nb),                        n / @as(f64, @floatFromInt(w.sample_rate)),
+                10 * std.math.log10(ss / n + 1e-20), 20 * std.math.log10(@as(f64, peak) + 1e-20), bad,
+            });
+        }
+        return;
+    }
+    const iters: usize = if (it.next()) |n| try std.fmt.parseInt(usize, n, 10) else 50;
+    mlx.installErrorHandler();
+    const s = mlx.mlx_default_gpu_stream_new();
+    const m = try ming.Model.load(a, s, dir, .{});
+    defer m.deinit();
+
+    var g0 = ming.G.init(a, s);
+    defer g0.deinit();
+    const z = try g0.normal(&.{ 1, 1, 896 }, .bfloat16);
+    const hist = try g0.normal(&.{ 1, 1, 64 }, .bfloat16);
+    const noise = try g0.normal(&.{ 1, 1, 64 }, .bfloat16);
+    const sde = try g0.normal(&.{ 10, 1, 1, 64 }, .bfloat16);
+    try ming.evalAll(&.{ z, hist, noise, sde });
+
+    var outs: [2]Arr = undefined;
+    for ([_][]const u8{ "1", "0" }, 0..) |flag, k| {
+        _ = setenv("MING_FUSED", @ptrCast(flag.ptr), 1);
+        if (m.cfm_compiled) |c| _ = mlx.mlx_closure_free(c);
+        m.cfm_compiled = null;
+        outs[k] = try cfm(m, z, hist, noise, sde); // trace + warm
+        for (0..3) |_| _ = mlx.mlx_array_free(try cfm(m, z, hist, noise, sde));
+        const t0 = now(io);
+        for (0..iters) |_| _ = mlx.mlx_array_free(try cfm(m, z, hist, noise, sde));
+        std.debug.print("cfm MING_FUSED={s}: {d:.3} ms/sample\n", .{ flag, ms(io, t0) / @as(f64, @floatFromInt(iters)) });
+        // CPU side: graph build + async_eval (encode) vs waiting for the GPU.
+        var enc: f64 = 0;
+        var wait: f64 = 0;
+        for (0..iters) |_| {
+            var g = ming.G.init(m.a, m.s);
+            defer g.deinit();
+            const ta = now(io);
+            const y = try m.cfmSample(&g, z, hist, noise, sde, 2.0, 0.25, 0.0);
+            try ming.asyncEvalAll(&.{y});
+            enc += ms(io, ta);
+            const tb = now(io);
+            try ming.evalAll(&.{y});
+            wait += ms(io, tb);
+        }
+        const fi: f64 = @floatFromInt(iters);
+        std.debug.print("   encode {d:.3} ms, then wait {d:.3} ms\n", .{ enc / fi, wait / fi });
+    }
+    const d = try g0.abs(try g0.sub(try g0.astype(outs[0], .float32), try g0.astype(outs[1], .float32)));
+    const v = try ming.toF32(a, d, s);
+    defer a.free(v);
+    var mx: f32 = 0;
+    for (v) |e| mx = @max(mx, e);
+    const r = try ming.toF32(a, outs[1], s);
+    defer a.free(r);
+    var rm: f32 = 0;
+    for (r) |e| rm = @max(rm, @abs(e));
+    std.debug.print("cfm out max|fused-mlx| = {e:.3} (max|mlx| {e:.3})\n", .{ mx, rm });
+
+    // Per-kernel GPU time: N dispatches of one kernel on fixed inputs, one eval.
+    _ = setenv("MING_FUSED", "1", 1);
+    const b = &m.dit.fb[0];
+    const x = try g0.normal(&.{ 2, 3, 1024 }, .bfloat16);
+    const blk = try fused.block(b, x, m.dit.rot.tab[0], m.dit.rot.tab[1], s);
+    const parts = [_]Arr{ blk.qkv, blk.x1, blk.hh, blk.x2 };
+    try ming.evalAll(&parts);
+    defer for (parts) |q| {
+        _ = mlx.mlx_array_free(q);
+    };
+    const names = [_][]const u8{ "A qkv 6MB", "B attn+out 2MB", "C ff1 8MB", "D ff2 8MB" };
+    const mb = [_]f64{ 6, 2, 8, 8 };
+    const N = 200;
+    for (names, 0..) |name, ki| {
+        var best: f64 = 1e9;
+        for (0..3) |_| {
+            var g = ming.G.init(a, s);
+            defer g.deinit();
+            var ys: [N]Arr = undefined;
+            // Round-robin over all 16 DiT blocks (384 MB): weights come from DRAM.
+            for (&ys, 0..) |*y, yi| {
+                const bb = if (yi % 16 < 8) &m.dit.fb[yi % 8] else &m.agg.fb[yi % 8];
+                y.* = try g.keep(try fused.single(ki, bb, x, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+            }
+            const t0 = now(io);
+            try ming.evalAll(&ys);
+            best = @min(best, ms(io, t0) * 1000.0 / N);
+        }
+        std.debug.print("{s:<16} {d:6.1} us  {d:5.0} GB/s\n", .{ name, best, mb[ki] * 1.048576e6 / (best * 1e3) });
+    }
+    // Dependent chains (each dispatch waits for the previous): 0 = whole
+    // block, 1 = B alone (x = B(qkv, x)), 3 = D alone (x = D(hh, x)).
+    for ([_]usize{ 0, 1, 3, 4, 5 }) |ki| {
+        var best: f64 = 1e9;
+        for (0..3) |_| {
+            var g = ming.G.init(a, s);
+            defer g.deinit();
+            var y = x;
+            for (0..80) |yi| {
+                const bb = if (yi % 16 < 8) &m.dit.fb[yi % 8] else &m.agg.fb[yi % 8];
+                if (ki == 0) {
+                    const o = try fused.block(bb, y, m.dit.rot.tab[0], m.dit.rot.tab[1], s);
+                    for ([_]Arr{ o.qkv, o.x1, o.hh }) |q| _ = try g.keep(q);
+                    y = try g.keep(o.x2);
+                } else if (ki == 4) { // A then B
+                    const q = try g.keep(try fused.single(0, bb, y, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+                    y = try g.keep(try fused.single(1, bb, y, q, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+                } else if (ki == 5) { // C then D
+                    const h = try g.keep(try fused.single(2, bb, y, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+                    y = try g.keep(try fused.single(3, bb, y, blk.qkv, h, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+                } else y = try g.keep(try fused.single(ki, bb, y, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+            }
+            const t0 = now(io);
+            try ming.evalAll(&.{y});
+            best = @min(best, ms(io, t0) * 1000.0 / 80);
+        }
+        std.debug.print("chain {s:<10} {d:6.1} us\n", .{ ([_][]const u8{ "block", "B", "", "D", "AB", "CD" })[ki], best });
+    }
+    // Floor: a chain of 80 dependent tiny MLX adds.
+    {
+        var best: f64 = 1e9;
+        for (0..3) |_| {
+            var g = ming.G.init(a, s);
+            defer g.deinit();
+            var y = try g.keep(try ming.own(x));
+            const one = try g.scalar(1, .bfloat16);
+            for (0..80) |_| y = try g.add(y, one);
+            const t0 = now(io);
+            try ming.evalAll(&.{y});
+            best = @min(best, ms(io, t0) * 1000.0 / 80);
+        }
+        std.debug.print("chain {s:<10} {d:6.1} us\n", .{ "tiny add", best });
+    }
+    // Reference: MLX addmm for the same ff1 shape.
+    {
+        const h = try g0.normal(&.{ 6, 1024 }, .bfloat16);
+        try ming.evalAll(&.{h});
+        var best: f64 = 1e9;
+        for (0..3) |_| {
+            var g = ming.G.init(a, s);
+            defer g.deinit();
+            var ys: [N]Arr = undefined;
+            for (&ys, 0..) |*y, yi| y.* = try (if (yi % 16 < 8) m.dit.blocks[yi % 8] else m.agg.blocks[yi % 8]).ff1.f(&g, h);
+            const t0 = now(io);
+            try ming.evalAll(&ys);
+            best = @min(best, ms(io, t0) * 1000.0 / N);
+        }
+        std.debug.print("{s:<16} {d:6.1} us  {d:5.0} GB/s\n", .{ "MLX addmm ff1", best, 8 * 1.048576e6 / (best * 1e3) });
+    }
+    for (outs) |o| _ = mlx.mlx_array_free(o);
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

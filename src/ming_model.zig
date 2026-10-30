@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const fused = @import("ming_fused.zig");
 
 pub const Arr = mlx.mlx_array;
 pub const S = mlx.mlx_stream;
@@ -381,11 +382,12 @@ pub const Tensors = struct {
         try mlx.check(mlx.mlx_transpose_axes(&wt, w, &perm, 2, s));
         try self.extra.append(self.a, wt);
         const b: ?Arr = if (self.has(fmt ++ ".bias", args)) try self.get(fmt ++ ".bias", args) else null;
-        return .{ .wt = wt, .b = b };
+        return .{ .w = w, .wt = wt, .b = b };
     }
 };
 
 pub const Lin = struct {
+    w: Arr, // [out, in], for the fused kernels
     wt: Arr,
     b: ?Arr,
 
@@ -597,6 +599,7 @@ const Rotary = struct {
 const DitStack = struct {
     blocks: []DitBlock,
     rot: Rotary,
+    fb: []fused.Block,
 
     fn load(t: *Tensors, a: std.mem.Allocator, s: S, comptime prefix: []const u8, n: usize, seq_len: c_int) !DitStack {
         const blocks = try a.alloc(DitBlock, n);
@@ -615,7 +618,24 @@ const DitStack = struct {
         var rot: Rotary = .{ .inv_freq = try t.get(prefix ++ ".rotary_embed.inv_freq", .{}) };
         try rot.precompute(a, s, seq_len);
         try t.extra.appendSlice(t.a, &rot.tab);
-        return .{ .blocks = blocks, .rot = rot };
+        const fb = try a.alloc(fused.Block, n);
+        for (blocks, fb) |b, *f| f.* = .{
+            .norm1 = b.norm1,
+            .norm2 = b.norm2,
+            .wq = b.q.w,
+            .wk = b.k.w,
+            .wv = b.v.w,
+            .bq = b.q.b.?,
+            .bk = b.k.b.?,
+            .bv = b.v.b.?,
+            .wo = b.out.w,
+            .bo = b.out.b.?,
+            .w1 = b.ff1.w,
+            .b1 = b.ff1.b.?,
+            .w2 = b.ff2.w,
+            .b2 = b.ff2.b.?,
+        };
+        return .{ .blocks = blocks, .rot = rot, .fb = fb };
     }
 
     fn forward(st: *const DitStack, g: *G, x_in: Arr) !Arr {
@@ -623,6 +643,14 @@ const DitStack = struct {
         const B = sh[0];
         const L = sh[1];
         var x = x_in;
+        if (L == st.rot.tab_len and fused.eligible(x, g.s) and mlx.mlx_array_dtype(st.fb[0].wq) == .bfloat16) {
+            for (st.fb) |*b| {
+                const o = try fused.block(b, x, st.rot.tab[0], st.rot.tab[1], g.s);
+                for ([_]Arr{ o.qkv, o.x1, o.hh, o.x2 }) |y| _ = try g.keep(y);
+                x = o.x2;
+            }
+            return x;
+        }
         for (st.blocks) |*b| {
             const h = try g.rms(x, b.norm1, 1e-6);
             var q = try g.transpose(try g.reshape(try b.q.f(g, h), &.{ B, L, DIT_HEADS, DIT_HEAD_DIM }), &.{ 0, 2, 1, 3 });
@@ -759,6 +787,9 @@ pub const Model = struct {
     /// only on the fixed schedule, so they are built once, not every LM step.
     t_emb: [FLOW_STEPS]Arr,
     t_emb_dt: Dtype,
+    /// Per Euler step in `t_emb_dt`: t[i+1] - t[i] and |dt|**0.5 (fused path).
+    flow_dt: Arr,
+    flow_sq: Arr,
 
     pub fn load(a: std.mem.Allocator, s: S, model_dir: []const u8, opts: Options) !*Model {
         const path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{model_dir});
@@ -822,6 +853,12 @@ pub const Model = struct {
                 try t.extra.append(a, e.*);
             }
             try evalAll(&m.t_emb);
+            const n: c_int = @intCast(FLOW_STEPS);
+            m.flow_dt = try own(try g.sub(try g.sliceAxis(ts, 0, 1, n + 1, 1), try g.sliceAxis(ts, 0, 0, n, 1)));
+            try t.extra.append(a, m.flow_dt);
+            m.flow_sq = try own(try g.power(try g.abs(m.flow_dt), try g.scalar(0.5, m.dtype)));
+            try t.extra.append(a, m.flow_sq);
+            try evalAll(&.{ m.flow_dt, m.flow_sq });
         }
         var w32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&w32, try t.get("audio.decoder.head.istft.window", .{}), .float32, s));
@@ -844,6 +881,8 @@ pub const Model = struct {
         for ([_][]QLayer{ m.lm.layers, m.enc.layers, m.enc_agg.layers, m.dec.layers }) |ls| a.free(ls);
         a.free(m.dit.blocks);
         a.free(m.agg.blocks);
+        a.free(m.dit.fb);
+        a.free(m.agg.fb);
         m.t.deinit();
         a.destroy(m);
     }
@@ -990,9 +1029,11 @@ pub const Model = struct {
     /// noise dtype. `noise` [1,1,64], `sde` [10,1,1,64].
     pub fn cfmSampleRaw(m: *Model, g: *G, z: Arr, hist: Arr, noise: Arr, sde: Arr, cfg: f32, sigma: f32, temperature: f32) !Arr {
         const dt = mlx.mlx_array_dtype(noise);
+        const shift_k = sigma * std.math.sqrt(temperature);
+        if (fused.enabled() and mlx.streamIsGpu(g.s) and dt == .bfloat16 and dt == m.t_emb_dt and mlx.mlx_array_dtype(z) == .bfloat16)
+            return m.cfmSampleFused(g, z, hist, noise, sde, cfg, shift_k);
         const t = try flowSchedule(g, dt);
         var y = noise;
-        const shift_k = sigma * std.math.sqrt(temperature);
         for (1..FLOW_STEPS + 1) |i| {
             const t0 = try g.reshape(try g.sliceAxis(t, 0, @intCast(i - 1), @intCast(i), 1), &.{});
             const t1 = try g.reshape(try g.sliceAxis(t, 0, @intCast(i), @intCast(i + 1), 1), &.{});
@@ -1011,6 +1052,21 @@ pub const Model = struct {
                 const sq = try g.power(try g.abs(dtt), try g.scalar(0.5, dt));
                 y = try g.add(y, try g.mul(try g.mul(try g.scalar(shift_k, dt), sq), nz));
             }
+        }
+        return y;
+    }
+
+    /// cfmSampleRaw on the fused kernels: per Euler step one embed dispatch,
+    /// 4 per DiT block, one for final layer + CFG + Euler. The cond embedding
+    /// and x_embed(hist) are fixed across the 10 steps, so they run once.
+    fn cfmSampleFused(m: *Model, g: *G, z: Arr, hist: Arr, noise: Arr, sde: Arr, cfg: f32, shift_k: f32) !Arr {
+        const ce = try m.c_emb.f(g, try g.concat(&.{ z, try g.zeros(mlx.getShape(z), mlx.mlx_array_dtype(z)) }, 0));
+        const xh = try m.x_emb.f(g, hist);
+        var y = noise;
+        for (0..FLOW_STEPS) |i| {
+            var h = try g.keep(try fused.embed(y, m.x_emb.w, m.x_emb.b.?, m.t_emb[i], ce, xh, g.s));
+            h = try m.dit.forward(g, h);
+            y = try g.keep(try fused.final(h, m.dit_final_norm, m.dit_final.w, m.dit_final.b.?, y, m.flow_dt, m.flow_sq, sde, i, cfg, shift_k, g.s));
         }
         return y;
     }
