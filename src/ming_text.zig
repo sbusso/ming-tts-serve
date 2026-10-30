@@ -1523,7 +1523,7 @@ pub fn buildTtsPrompt(a: std.mem.Allocator, target_language: ?[]const u8) ![]u8 
     return std.fmt.allocPrint(a, "{s}Target language: {s}.\n", .{ DEFAULT_TTS_PROMPT, name });
 }
 
-fn jsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), v: ?[]const u8) !void {
+pub fn jsonStr(a: std.mem.Allocator, out: *std.ArrayList(u8), v: ?[]const u8) !void {
     const s = v orelse return out.appendSlice(a, "null");
     try out.append(a, '"');
     for (s) |c| switch (c) {
