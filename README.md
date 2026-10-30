@@ -1,5 +1,8 @@
 # ming-tts-serve
 
+[![CI](https://github.com/sbusso/ming-tts-serve/actions/workflows/ci.yml/badge.svg)](https://github.com/sbusso/ming-tts-serve/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sbusso/ming-tts-serve)](https://github.com/sbusso/ming-tts-serve/releases/latest)
+
 ming-tts-serve runs [Ming-3.0-tts-0.5b](https://huggingface.co/inclusionAI/Ming-3.0-tts-0.5b) (inclusionAI) natively on Apple silicon. It is written in Zig on top of MLX through mlx-c, with no Python at run time.
 
 It provides:
@@ -10,7 +13,54 @@ It provides:
 
 All Ming tasks are supported: TTS, voice cloning, MULTILINGUAL, BASIC, EMOTION, DIALECT, IP (built-in voices), FREEFORM and VOICE_DESIGN.
 
-## Quick start
+## Install from a release
+
+A release is a prebuilt `ming-tts` binary with the MLX runtime. It needs a Mac with Apple silicon and macOS 26.2 or later, but no Xcode, Zig or CMake. To build it yourself instead, see [Build from source](#build-from-source).
+
+1. Download and check the tarball from the [releases page](https://github.com/sbusso/ming-tts-serve/releases/latest). Set `VERSION` to the release you want, without the leading `v`:
+
+   ```sh
+   VERSION=0.1.0
+   NAME=ming-tts-serve-$VERSION-macos-arm64
+   curl -fLO https://github.com/sbusso/ming-tts-serve/releases/download/v$VERSION/$NAME.tar.gz
+   curl -fLO https://github.com/sbusso/ming-tts-serve/releases/download/v$VERSION/$NAME.tar.gz.sha256
+   shasum -a 256 -c $NAME.tar.gz.sha256
+   ```
+
+2. Extract it anywhere. The folder holds `bin/ming-tts`, the MLX libraries in `lib/`, and the docs. Keep `bin/` and `lib/` together; the binary finds the libraries through a path relative to itself.
+
+   ```sh
+   tar -xzf $NAME.tar.gz
+   cd $NAME
+   ```
+
+   If you downloaded the tarball with a browser, macOS marks the files as quarantined and refuses to run them. Clear the mark:
+
+   ```sh
+   xattr -dr com.apple.quarantine .
+   ```
+
+   The binaries are ad-hoc signed, not notarized by Apple. Notarization is planned for a later release.
+
+3. Download the model (about 3 GB) with [uv](https://docs.astral.sh/uv/):
+
+   ```sh
+   uvx --from huggingface_hub hf download inclusionAI/Ming-3.0-tts-0.5b --local-dir models/Ming-3.0-tts-0.5b
+   ```
+
+4. Make your first audio:
+
+   ```sh
+   bin/ming-tts say --out hello.wav \
+     --json '{"task":"IP","voice":"UK_George","text":"Hello from Ming."}'
+   afplay hello.wav
+   ```
+
+   `ming-tts` looks for the model in `models/Ming-3.0-tts-0.5b` under the current directory. From another directory, pass `--model DIR` or set `MING_MODEL_DIR`.
+
+The rest of this README uses `zig-out/bin/ming-tts`, the path of a source build. With a release, use `bin/ming-tts` instead.
+
+## Build from source
 
 These steps take you from a new Mac to spoken audio in about 10 minutes. Most of that time is the model download and the first build of MLX.
 
@@ -118,7 +168,8 @@ zig build test
 | `cmake: command not found` during the first build | Run `brew install cmake`. |
 | Build fails in `lib/mlx-src` or `lib/mlxc-src` | Run `git submodule update --init`, then `zig build mlx`. |
 | `missing weight` or `FileNotFound` at start | The model is not in `models/Ming-3.0-tts-0.5b`. Pass `--model DIR` or set `MING_MODEL_DIR`. |
-| `dyld: Library not loaded: libmlxc.dylib` | Run the binaries from `zig-out/bin` inside the checkout; they find MLX through a relative path. |
+| `dyld: Library not loaded: libmlxc.dylib` | Run the binaries from `zig-out/bin` inside the checkout; they find MLX through a relative path. For a release, keep `bin/` and `lib/` in the same folder. |
+| A release binary is "damaged" or "cannot be opened" | Clear the browser quarantine: `xattr -dr com.apple.quarantine <release folder>`. |
 
 ## Use the CLI
 
@@ -256,6 +307,18 @@ zig-out/bin/ming-parity models/Ming-3.0-tts-0.5b <dump-dir> bf16 lingguang.wav
 
 The last argument can be replaced with `MING_REF_WAV`. Use `f32` instead of `bf16` for a CPU run that must agree to rounding.
 
+## Make a release
+
+1. Set `.version` in `build.zig.zon` to the new version, and commit.
+2. Tag the commit with the same version and a leading `v`, and push the tag:
+
+   ```sh
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+The release workflow checks that the tag matches `build.zig.zon`, runs the tests, builds the tarball with `scripts/package.sh` and publishes it as a GitHub release. To build the same tarball locally, run `scripts/package.sh`; it writes to `dist/`.
+
 ## Layout
 
 | Path | Contents |
@@ -269,6 +332,7 @@ The last argument can be replaced with `MING_REF_WAV`. Use `f32` instead of `bf1
 | `src/ming_main.zig` | `ming-tts` server and CLI. |
 | `src/mlx.zig`, `src/tokenizer.zig`, `src/wav.zig`, `src/log.zig`, `src/io_util.zig` | MLX bindings, tokenizer, WAV and logging helpers, adapted from mlx-serve. |
 | `scripts/build-mlx.sh`, `patches/` | MLX and mlx-c build. |
+| `scripts/package.sh` | Release tarball (also run by `.github/workflows/release.yml`). |
 
 ## Credits
 
