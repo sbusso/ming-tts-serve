@@ -110,6 +110,8 @@ afplay clone.wav
 
 For French, German, Spanish, Japanese or Korean, use `"task": "MULTILINGUAL"` with `"language": "fr"` (or `de`, `es`, `ja`, `ko`).
 
+Other tasks detect these languages from the text (see `MING_LANG_DETECT`). Detected text keeps its accents and skips the Chinese/English normalizer, and French numbers are spelled out in French. TTS, BASIC and EMOTION also get the `Target language:` prompt line. IP, FREEFORM and VOICE_DESIGN do not, because the line changes the built-in or described voice. Upstream sends such text through the Chinese/English normalizer, which spells numbers in English and replaces accented letters with `，`.
+
 ### 7. Run the server
 
 ```sh
@@ -164,6 +166,31 @@ Print the text frontend's fragments and token ids without loading the model weig
 zig-out/bin/ming-tts frontend --json '[{"task":"TTS","text":"Bonjour à tous."}]'
 ```
 
+## Long text
+
+Requests accept up to 50,000 characters by default (about an hour of speech; `MING_MAX_TEXT_CHARS` changes the limit). The engine splits the text and generates it one fragment at a time and frees MLX's buffer cache after each one, so GPU memory stays the same for any length (peak memory footprint of `ming-tts say` about 5.5 GB for 5 minutes, against 31 GB without freeing the cache); the finished audio takes about 10.6 MB of memory per minute. Generation runs at about 0.11 s per second of audio: a 5-minute text takes about 35 seconds on an M5 Max.
+
+How the text is split:
+
+1. Paragraphs: every line break starts a paragraph, except a hard wrap (a line that does not end a sentence, followed by a line that starts with a lowercase letter), which is joined with a space.
+2. Sentences and clauses: each paragraph goes through the upstream frontend, which cuts it into fragments of about 24 words or Chinese characters at sentence ends, then at commas.
+
+Each pair of consecutive fragments is joined with a pause chosen by what separates them. The engine cuts each fragment's leading and trailing silence (keeping 40 ms before the speech and 80 ms after it), fades the cut edges over 10 ms, and inserts silence so that the gap from the end of one fragment's speech to the start of the next is:
+
+| Boundary | Pause |
+| --- | --- |
+| Inside a sentence (the fragment ends at a comma or mid-clause) | 0.20 s |
+| End of a sentence | 0.40 s |
+| End of a paragraph | 0.85 s |
+
+The values follow the model's own pauses inside a fragment: on a 5-minute English clone, the median pause after a comma is 120 ms (90th percentile 280 ms) and after a sentence end 390 ms (90th percentile 460 ms). The `pause_scale` request field multiplies all three (0 to 4, default 1); the gap never drops below the 120 ms of kept edges. The start of the first fragment and the end of the last keep the model's own silence, so text that fits in one fragment produces the same audio as before. Streaming clients receive the pauses as runs of zero samples.
+
+`MING_JOIN=0` turns this off and concatenates the fragments as upstream does (each fragment keeps up to 300 ms of trailing silence and all of its leading silence, whatever the boundary).
+
+Measured on 5-minute English (built-in voice and clone) and 2.5-minute French (clone) texts: Whisper word error rate 0.4 to 2.7 % (mostly digits versus spelled numbers), CAM++ similarity between the first and last 30 seconds 0.95 to 0.98, no clipped samples, and fragment speech levels within ±1 dB (largest jump between neighbors 2.6 dB). Every fragment is generated from the same prompt with no state carried over, so voice and speaking rate do not drift: the per-fragment speaking rate changes by -3 % to +3 % from the first to the last quarter of the English texts, which is the spread of the text itself.
+
+Breaths: the model's `[Breathing]` tag at the start of a paragraph was tested and is not used. Over 40 tagged clips (10 sentences in English, French and Chinese, 4 voices, 4 seeds each), an audible breath (0.2 s or more before the speech) appeared in 22; it lowered CAM++ similarity to the untagged clip (0.82 to 0.91, against 0.89 to 0.94 between seeds) and added a character error to the first word in 3 of 8 Chinese clips. No words were inserted.
+
 ## Run the server
 
 ```sh
@@ -178,7 +205,7 @@ The server listens on `http://127.0.0.1:8765`. Options:
 | `--host ADDR` | | `127.0.0.1` |
 | `--port N` | `MING_PORT` | `8765` |
 | `--output-dir DIR` | `MING_OUTPUT_DIR` | `~/Library/Caches/ming-tts` |
-| | `MING_MAX_TEXT_CHARS` | `1000` |
+| | `MING_MAX_TEXT_CHARS` | `50000` |
 
 The model loads in the background. `GET /health` reports `"loaded": true` when it is ready.
 
@@ -202,9 +229,12 @@ These switches change engine behavior. They exist for A/B comparisons and diagno
 | `MING_SOFT_LIMIT` | on | Soft-limit output peaks (ceiling 0.98) instead of hard clipping at 1.0. |
 | `MING_GUARD` | on | Regenerate text fragments whose speaking rate is implausible. |
 | `MING_FR_TN` | on | French text normalization for MULTILINGUAL with language `fr`: spells out numbers, times and amounts, and flattens French typography. |
+| `MING_LANG_DETECT` | `auto` | Language detection for tasks other than MULTILINGUAL. `auto`: French, German, Spanish, Japanese or Korean text takes the MULTILINGUAL text path, and TTS, BASIC and EMOTION also get the `Target language:` prompt line. `text`: the text path only. `prompt`: the line for every task except DIALECT. `0`: off, as upstream. |
+| `MING_JOIN` | on | Join text fragments with pauses by boundary (see [Long text](#long-text)). `0` concatenates them as upstream does. |
+| `MING_CLEAR_CACHE` | on | Free MLX's buffer cache after each fragment of a multi-fragment text. Output is unchanged; `0` keeps the cache, which grows with the text. |
 | `MING_PROFILE` | off | Any value prints per-step timing and step budgets to stderr. |
 
-With `MING_FUSED=0`, `MING_PROMPT_NORM=0`, `MING_SOFT_LIMIT=0`, `MING_GUARD=0` and `MING_FR_TN=0`, the engine follows the upstream Ming pipeline op for op.
+With `MING_FUSED=0`, `MING_PROMPT_NORM=0`, `MING_SOFT_LIMIT=0`, `MING_GUARD=0`, `MING_FR_TN=0`, `MING_LANG_DETECT=0` and `MING_JOIN=0`, the engine follows the upstream Ming pipeline op for op.
 
 ## Embed the engine in a Zig program
 
@@ -237,7 +267,7 @@ var status: u16 = 0;
 const json = try svc.handle(arena, "POST", "/generate", body, &status);
 ```
 
-`Service.handle` takes the same JSON as the HTTP server and returns the same JSON. `Service.handleStream` also passes each text fragment's audio to a callback as soon as it is generated. For a typed API without JSON, use `ming.engine` (`src/ming_tts.zig`). All MLX work runs on one engine thread, so `handle` can be called from any thread.
+`Service.handle` takes the same JSON as the HTTP server and returns the same JSON. `Service.handleStream` also passes each text fragment's audio, and the pause after it, to a callback as soon as it is generated; the callback's optional `progress` function receives the fragment count and the share of the text done, for a progress bar or a time estimate. For a typed API without JSON, use `ming.engine` (`src/ming_tts.zig`). All MLX work runs on one engine thread, so `handle` can be called from any thread.
 
 ## Audio samples
 

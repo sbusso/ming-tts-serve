@@ -3,8 +3,8 @@
 //! `StepAudio2CAMPPlus` (BatchNorms before convolutions are folded into the
 //! convolution biases, as in the ONNX export).
 //!
-//! Weights load from the checkpoint's `campplus.safetensors`, which holds the
-//! ONNX initializers verbatim: the folded convolutions are anonymous
+//! Weights load from the checkpoint's `campplus.onnx` initializers, or from a
+//! `campplus.safetensors` holding them verbatim (mlx-audio's conversion): the folded convolutions are anonymous
 //! `onnx::Conv_<n>` pairs in graph order, everything else keeps its
 //! `xvector.*` name. Torch layouts are transposed to MLX at load.
 //! Input: mono 16 kHz audio → Kaldi fbank (`ming_audio.fbank`), mean-normalized.
@@ -42,9 +42,22 @@ pub const Campplus = struct {
     dense_bn: Bn,
 
     pub fn load(a: std.mem.Allocator, s: mm.S, path: []const u8) !*Campplus {
-        const self = try a.create(Campplus);
+        return fromTensors(a, s, try mm.Tensors.load(a, path, .float32, s));
+    }
+
+    /// Load straight from the checkpoint's `campplus.onnx` (same tensors).
+    pub fn loadOnnx(io: std.Io, a: std.mem.Allocator, s: mm.S, path: []const u8) !*Campplus {
+        return fromTensors(a, s, try mm.Tensors.loadOnnx(a, io, path, .float32, s));
+    }
+
+    fn fromTensors(a: std.mem.Allocator, s: mm.S, tensors: mm.Tensors) !*Campplus {
+        var t = tensors;
+        const self = a.create(Campplus) catch |e| {
+            t.deinit();
+            return e;
+        };
         errdefer a.destroy(self);
-        self.* = .{ .t = try mm.Tensors.load(a, path, .float32, s), .a = a, .s = s, .head = undefined, .tdnn = undefined, .layers = undefined, .transits = undefined, .dense_w = undefined, .dense_bn = undefined };
+        self.* = .{ .t = t, .a = a, .s = s, .head = undefined, .tdnn = undefined, .layers = undefined, .transits = undefined, .dense_w = undefined, .dense_bn = undefined };
         errdefer self.deinit();
 
         // Anonymous folded convolutions, in graph order.

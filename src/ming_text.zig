@@ -1413,6 +1413,22 @@ pub fn isFrench(language_id: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(l, "fr") or std.ascii.eqlIgnoreCase(l, "french") or std.ascii.startsWithIgnoreCase(l, "fr-") or std.ascii.startsWithIgnoreCase(l, "fr_");
 }
 
+/// Text without a language_id (TTS, IP, EMOTION, BASIC, DIALECT, FREEFORM,
+/// VOICE_DESIGN) that `detectLanguage` reads as French, German, Spanish,
+/// Japanese or Korean takes the MULTILINGUAL text path: no zh/en
+/// normalization (which spells numbers in English and turns accented letters
+/// into "，"), and the French normalizer for fr. Departs from upstream, which
+/// sends such text through the zh/en path (MING_LANG_DETECT).
+/// - `text`: the text only.
+/// - `auto`: also add the "Target language: X." line for TTS, BASIC and
+///   EMOTION, where the voice comes from a reference clip or from none. Not
+///   for IP, FREEFORM and VOICE_DESIGN: there the line moves the captioned
+///   voice (UK_George on French: CAM++ 0.75 to its English voice with the
+///   line, 0.94 without). Not for DIALECT, which upstream keeps languageless.
+/// - `prompt`: the line for every task but DIALECT.
+pub const DetectLanguage = enum { off, text, auto, prompt };
+pub var detect_language: DetectLanguage = .auto;
+
 /// MULTILINGUAL fr/de/es: the cutter rewrites the punctuation it splits on
 /// to the Chinese full-width forms ("Bonjour à tous，voici …。"), as upstream
 /// does. Put the ASCII forms back (Latin-script languages only; Japanese
@@ -1471,6 +1487,97 @@ pub fn prepareText(a: std.mem.Allocator, text_in: []const u8, language_id: ?[]co
     }
     if (out.items.len == 0) return error.NoFragments;
     return out;
+}
+
+/// What separates a fragment from the next one; `Engine.synthesize` picks
+/// the pause length from it.
+pub const Boundary = enum { none, clause, sentence, paragraph };
+
+pub const Fragment = struct {
+    text: []u8,
+    /// The boundary after this fragment (`.none` for the last one).
+    after: Boundary,
+};
+
+pub fn freeFragments(a: std.mem.Allocator, frags: *std.ArrayList(Fragment)) void {
+    for (frags.items) |f| a.free(f.text);
+    frags.deinit(a);
+}
+
+/// `prepareText` for long text: split into paragraphs first, run
+/// `prepareText` on each, and tag every fragment with the boundary that
+/// follows it. A line break starts a new paragraph unless the line does not
+/// end a sentence and the next line starts with a lowercase letter (a hard
+/// wrap, joined with a space). Text without line breaks gives the same
+/// fragments as `prepareText`. Departs from upstream, which turns line breaks
+/// into spaces.
+pub fn prepareLongText(a: std.mem.Allocator, text_in: []const u8, language_id: ?[]const u8, max_len: usize) !std.ArrayList(Fragment) {
+    var out: std.ArrayList(Fragment) = .empty;
+    errdefer freeFragments(a, &out);
+    var paras = try splitParagraphs(a, text_in);
+    defer {
+        for (paras.items) |p| a.free(p);
+        paras.deinit(a);
+    }
+    for (paras.items) |p| {
+        var frags = prepareText(a, p, language_id, max_len) catch |e| switch (e) {
+            error.NoFragments => continue, // e.g. a line of dashes
+            else => return e,
+        };
+        defer frags.deinit(a);
+        if (out.items.len > 0) out.items[out.items.len - 1].after = .paragraph;
+        out.ensureUnusedCapacity(a, frags.items.len) catch |e| {
+            for (frags.items) |f| a.free(f);
+            return e;
+        };
+        for (frags.items) |f| out.appendAssumeCapacity(.{ .text = f, .after = if (endsSentence(f)) .sentence else .clause });
+    }
+    if (out.items.len == 0) return error.NoFragments;
+    out.items[out.items.len - 1].after = .none;
+    return out;
+}
+
+/// Paragraphs of `s` (owned UTF-8, non-blank), see `prepareLongText`.
+fn splitParagraphs(a: std.mem.Allocator, s: []const u8) !std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| a.free(p);
+        out.deinit(a);
+    }
+    var cur: std.ArrayList(u8) = .empty;
+    defer cur.deinit(a);
+    var lines = std.mem.splitAny(u8, s, "\n\r");
+    while (lines.next()) |raw| {
+        const line = strip(raw);
+        if (line.len == 0) {
+            if (cur.items.len > 0) try out.append(a, try cur.toOwnedSlice(a));
+            continue;
+        }
+        if (cur.items.len > 0) {
+            const hard_wrap = !endsSentence(cur.items) and std.ascii.isLower(line[0]);
+            if (hard_wrap) try cur.append(a, ' ') else try out.append(a, try cur.toOwnedSlice(a));
+        }
+        try cur.appendSlice(a, line);
+    }
+    if (cur.items.len > 0) try out.append(a, try cur.toOwnedSlice(a));
+    return out;
+}
+
+/// Ends with sentence punctuation, ignoring trailing spaces, closing quotes
+/// and brackets.
+fn endsSentence(s: []const u8) bool {
+    var e = s.len;
+    while (e > 0) {
+        var st = e - 1;
+        while (st > 0 and (s[st] & 0xc0) == 0x80) st -= 1;
+        const c = std.unicode.utf8Decode(s[st..e]) catch return false;
+        if (isSpace(c) or inSet(c, "\"')]}»”’」』）")) {
+            e = st;
+            continue;
+        }
+        return inSet(c, ".!?。！？…");
+    }
+    return false;
 }
 
 /// core.spoken_units: Latin words + every digit and non-ASCII letter.
@@ -1732,7 +1839,14 @@ pub fn buildRequest(a: std.mem.Allocator, in: TaskInput, d: *Diag) !Request {
         if (has_controls) return d.set("{s} does not accept controls", .{task});
         instruction = try normalizeInstruction(a, in.instruction);
     }
-    const prompt = try buildTtsPrompt(a, language_id);
+    const detected = if (language_id != null and !isBlank(language_id.?) or detect_language == .off) null else detectLanguage(text_s);
+    const text_language = detected orelse language_id;
+    const line = runtime.? != .DIALECT and switch (detect_language) {
+        .off, .text => false,
+        .auto => runtime.? == .TTS or runtime.? == .BASIC or runtime.? == .EMOTION,
+        .prompt => true,
+    };
+    const prompt = try buildTtsPrompt(a, if (line and detected != null) detected else language_id);
     errdefer a.free(prompt);
     return .{
         .prompt = prompt,
@@ -1746,7 +1860,7 @@ pub fn buildRequest(a: std.mem.Allocator, in: TaskInput, d: *Diag) !Request {
         .sigma = in.sigma,
         .temperature = in.temperature,
         .taskname = runtime.?,
-        .text_language = language_id,
+        .text_language = text_language,
     };
 }
 
@@ -2006,4 +2120,80 @@ test "detectLanguage" {
         const got = detectLanguage(c[0]);
         if (c[1]) |want| try std.testing.expectEqualStrings(want, got orelse "null") else try std.testing.expectEqual(@as(?[]const u8, null), got);
     }
+}
+
+test "buildRequest routes detected fr/de/es/ja/ko text off the zh/en path" {
+    const a = std.testing.allocator;
+    const saved = detect_language;
+    defer detect_language = saved;
+    const fr = "En 1895, 96 % des billets coûtaient 100 €. C'est l'été.";
+    const Case = struct { mode: DetectLanguage, in: TaskInput, lang: ?[]const u8, line: ?[]const u8 };
+    const cases = [_]Case{
+        // Captioned voices: the text only.
+        .{ .mode = .auto, .in = .{ .task = "IP", .text = fr, .controls = .{ .ip = "UK_George" } }, .lang = "fr", .line = null },
+        .{ .mode = .auto, .in = .{ .task = "FREEFORM", .text = fr, .instruction = "A calm voice." }, .lang = "fr", .line = null },
+        .{ .mode = .auto, .in = .{ .task = "DIALECT", .text = fr, .controls = .{ .dialect = "cantonese" } }, .lang = "fr", .line = null },
+        // Voice from a reference clip or none: the line too.
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = fr }, .lang = "fr", .line = "French" },
+        .{ .mode = .auto, .in = .{ .task = "EMOTION", .text = fr, .controls = .{ .emotion = "中性" } }, .lang = "fr", .line = "French" },
+        .{ .mode = .auto, .in = .{ .task = "BASIC", .text = "Guten Morgen, heute scheint die Sonne und wir gehen in den Park.", .controls = .{ .speed = "中速" } }, .lang = "de", .line = "German" },
+        .{ .mode = .prompt, .in = .{ .task = "IP", .text = fr, .controls = .{ .ip = "UK_George" } }, .lang = "fr", .line = "French" },
+        .{ .mode = .text, .in = .{ .task = "TTS", .text = fr }, .lang = "fr", .line = null },
+        .{ .mode = .off, .in = .{ .task = "TTS", .text = fr }, .lang = null, .line = null },
+        // zh/en text and explicit languages are left alone.
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = "The garden stays open until sunset, and visitors leave by the north gate." }, .lang = null, .line = null },
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = "今天天气很好，我们一起去公园散步吧。" }, .lang = null, .line = null },
+        .{ .mode = .auto, .in = .{ .task = "TTS", .text = fr, .language_id = "English" }, .lang = "English", .line = "English" },
+    };
+    for (cases) |c| {
+        detect_language = c.mode;
+        var d: Diag = .{};
+        const req = try buildRequest(a, c.in, &d);
+        defer req.deinit(a);
+        try std.testing.expectEqualStrings(c.lang orelse "null", req.text_language orelse "null");
+        const want = if (c.line) |l| try std.fmt.allocPrint(a, "{s}Target language: {s}.\n", .{ DEFAULT_TTS_PROMPT, l }) else try a.dupe(u8, DEFAULT_TTS_PROMPT);
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, req.prompt);
+    }
+    // The French path spells the numbers in French and keeps the accents.
+    detect_language = .auto;
+    var d: Diag = .{};
+    const req = try buildRequest(a, .{ .task = "IP", .text = fr, .controls = .{ .ip = "UK_George" } }, &d);
+    defer req.deinit(a);
+    var frags = try prepareText(a, req.text, req.text_language, 24);
+    defer {
+        for (frags.items) |f| a.free(f);
+        frags.deinit(a);
+    }
+    const joined = try std.mem.join(a, " ", frags.items);
+    defer a.free(joined);
+    try std.testing.expectEqualStrings("En mille huit cent quatre-vingt-quinze, quatre-vingt-seize pour cent des billets coûtaient cent euros. C'est l'été.", joined);
+}
+
+test "prepareLongText tags clause, sentence and paragraph boundaries" {
+    const a = std.testing.allocator;
+    const txt = "The garden will remain open until sunset, provided the weather stays clear, and visitors are asked to leave by the north gate. After that, the lights along the river path will switch on.\n\nChapter two\nIt was\nlate.";
+    var frags = try prepareLongText(a, txt, null, 24);
+    defer freeFragments(a, &frags);
+    // One paragraph without line breaks: the same fragments as prepareText.
+    var plain = try prepareText(a, txt[0..std.mem.indexOf(u8, txt, "\n").?], null, 24);
+    defer {
+        for (plain.items) |f| a.free(f);
+        plain.deinit(a);
+    }
+    for (plain.items, 0..) |f, i| try std.testing.expectEqualStrings(f, frags.items[i].text);
+    const n = plain.items.len;
+    try std.testing.expectEqual(Boundary.sentence, frags.items[0].after);
+    try std.testing.expectEqual(Boundary.paragraph, frags.items[n - 1].after);
+    // "Chapter two" is its own paragraph; "It was\nlate." is a hard wrap.
+    try std.testing.expectEqualStrings("Chapter two.", frags.items[n].text);
+    try std.testing.expectEqual(Boundary.paragraph, frags.items[n].after);
+    try std.testing.expectEqualStrings("It was late.", frags.items[n + 1].text);
+    try std.testing.expectEqual(Boundary.none, frags.items[n + 1].after);
+    try std.testing.expectEqual(n + 2, frags.items.len);
+    // A long sentence cut inside: the first piece ends at a clause.
+    var long = try prepareLongText(a, "雨后的山谷很安静，远处的云慢慢变成了金色，我们沿着小路走回了村子，路边的稻田在风里轻轻摇晃，狗在远处叫了几声。", null, 24);
+    defer freeFragments(a, &long);
+    try std.testing.expect(long.items.len > 1);
+    try std.testing.expectEqual(Boundary.clause, long.items[0].after);
 }

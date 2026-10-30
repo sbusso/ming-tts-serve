@@ -249,6 +249,74 @@ pub fn trimTrailingSilence(x: []const f32, sample_rate: u32) []const f32 {
     return body[0..@min(end, body.len)];
 }
 
+/// Sample range from the first to the end of the last 10 ms frame whose RMS
+/// is within `SPEECH_RANGE_DB` of the loudest frame and above
+/// `SPEECH_FLOOR_DB`. Empty (0, 0) when no frame qualifies.
+pub fn speechBounds(x: []const f32, sample_rate: u32) struct { start: usize, end: usize } {
+    const n: usize = @max(1, sample_rate / 100);
+    const frames = x.len / n;
+    var max_ms: f64 = 0;
+    for (0..frames) |k| max_ms = @max(max_ms, meanSquare(x[k * n ..][0..n]));
+    const thr = @max(max_ms * std.math.pow(f64, 10, -SPEECH_RANGE_DB / 10), std.math.pow(f64, 10, SPEECH_FLOOR_DB / 10));
+    var first: ?usize = null;
+    var last: usize = 0;
+    for (0..frames) |k| if (meanSquare(x[k * n ..][0..n]) >= thr) {
+        if (first == null) first = k;
+        last = k;
+    };
+    const f = first orelse return .{ .start = 0, .end = 0 };
+    return .{ .start = f * n, .end = (last + 1) * n };
+}
+
+pub const SPEECH_RANGE_DB: f64 = 45;
+pub const SPEECH_FLOOR_DB: f64 = -60;
+
+/// Speech RMS in dBFS: mean power of the 20 ms frames within 30 dB of the
+/// loudest one (the measure `normalizePrompt` uses). -inf for silence.
+pub fn speechRmsDb(x: []const f32, sample_rate: u32) f64 {
+    const n: usize = @max(1, sample_rate / 50);
+    var max_ms: f64 = 0;
+    var i: usize = 0;
+    while (i + n <= x.len) : (i += n) max_ms = @max(max_ms, meanSquare(x[i..][0..n]));
+    if (max_ms <= 1e-12) return -std.math.inf(f64);
+    var sum: f64 = 0;
+    var count: usize = 0;
+    i = 0;
+    while (i + n <= x.len) : (i += n) {
+        const ms = meanSquare(x[i..][0..n]);
+        if (ms >= max_ms * 1e-3) {
+            sum += ms;
+            count += 1;
+        }
+    }
+    return 10 * std.math.log10(sum / @as(f64, @floatFromInt(count)));
+}
+
+/// Raised-cosine fade over the first (`in`) or last `n` samples of `x`.
+pub fn fade(x: []f32, n_in: usize, dir: enum { in, out }) void {
+    const n = @min(n_in, x.len);
+    for (0..n) |k| {
+        const w: f32 = @floatCast(0.5 - 0.5 * @cos(std.math.pi * (@as(f64, @floatFromInt(k)) + 0.5) / @as(f64, @floatFromInt(n))));
+        switch (dir) {
+            .in => x[k] *= w,
+            .out => x[x.len - 1 - k] *= w,
+        }
+    }
+}
+
+test "speechBounds finds the loud span" {
+    var x: [44100]f32 = @splat(0);
+    for (4410..8820) |i| x[i] = 0.3 * @sin(@as(f32, @floatFromInt(i)) * 0.2);
+    for (0..44100) |i| x[i] += if (i % 2 == 0) 1e-5 else -1e-5; // noise floor
+    const b = speechBounds(&x, 44100);
+    try std.testing.expectEqual(@as(usize, 4410), b.start);
+    try std.testing.expectEqual(@as(usize, 8820), b.end);
+    var y: [100]f32 = @splat(1);
+    fade(&y, 10, .in);
+    fade(&y, 10, .out);
+    try std.testing.expect(y[0] < 0.05 and y[99] < 0.05 and y[50] == 1);
+}
+
 test "resample keeps a DC level and the torchaudio output length" {
     const a = std.testing.allocator;
     var x: [4800]f32 = undefined;
