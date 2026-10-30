@@ -1,0 +1,47 @@
+name: Set up the build
+description: Select Xcode, install Zig, and restore or build lib/mlx.
+
+runs:
+  using: composite
+  steps:
+    - name: Select Xcode
+      shell: bash
+      run: |
+        sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+        xcodebuild -version
+        xcrun --sdk macosx --show-sdk-version
+
+    - name: Install Zig
+      shell: bash
+      run: |
+        url="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+        curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" "$url"
+        echo "${ZIG_SHA256}  $RUNNER_TEMP/zig.tar.xz" | shasum -a 256 -c
+        tar -xf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+        echo "$RUNNER_TEMP/zig-aarch64-macos-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+    - name: Compute the MLX cache key
+      id: mlx-key
+      shell: bash
+      run: |
+        subs="$(git submodule status lib/mlx-src lib/mlxc-src | awk '{print $1}' | tr -d '+-' | tr '\n' '-')"
+        echo "key=mlx-${XCODE_VERSION}-${subs}${{ hashFiles('patches/**', 'scripts/build-mlx.sh') }}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore lib/mlx
+      id: mlx-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: lib/mlx
+        key: ${{ steps.mlx-key.outputs.key }}
+
+    - name: Install the Metal toolchain and CMake
+      if: steps.mlx-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        xcrun -sdk macosx metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+        command -v cmake >/dev/null || brew install cmake
+
+    - name: Build MLX
+      if: steps.mlx-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: zig build mlx

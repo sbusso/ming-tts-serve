@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The runner has no model and a virtual GPU: CI builds and runs the unit
+  # tests, which need neither.
+  XCODE_VERSION: "26.6"
+  ZIG_VERSION: "0.17.0"
+  ZIG_SHA256: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - uses: ./.github/actions/setup
+
+      - name: Check formatting
+        run: zig fmt --check src build.zig
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run the unit tests
+        run: zig build test --summary all
