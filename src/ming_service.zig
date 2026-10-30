@@ -132,7 +132,10 @@ fn worker(st: *State) void {
     defer eng.deinit();
     // Compile Metal kernels once so the first request is not slow.
     var d: ming.Diag = .{};
-    if (eng.tts("Warm up.", "UK_George", null, 0, &d)) |w| a.free(w) else |_| {}
+    if (eng.tts("Warm up.", "UK_George", null, 0, &d)) |w| {
+        defer a.free(w);
+        warmClone(st.io, a, &eng, w);
+    } else |_| {}
     st.load_s = @as(f64, @floatFromInt(t0.untilNow(st.io, .awake).nanoseconds)) / 1e9;
     st.loaded.store(true, .release);
     std.log.info("[ming] model loaded in {d:.2}s", .{st.load_s});
@@ -147,6 +150,22 @@ fn worker(st: *State) void {
         st.cond.broadcast(st.io);
         st.mu.unlock(st.io);
     }
+}
+
+/// Run one clone on `samples` so the prompt path (resampler, CAM++, VAE
+/// encoder kernels) is compiled before the first real clone request.
+fn warmClone(io: std.Io, a: Allocator, eng: *ming.Engine, samples: []const f32) void {
+    const dir = if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp";
+    var buf: [1024]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/ming-warmup-{d}.wav", .{ std.mem.trimEnd(u8, dir, "/"), std.c.getpid() }) catch return;
+    const bytes = wav.encodePcm16Mono(a, samples, ming.SAMPLE_RATE) catch return;
+    defer a.free(bytes);
+    const f = std.Io.Dir.createFileAbsolute(io, path, .{}) catch return;
+    f.writeStreamingAll(io, bytes) catch {};
+    f.close(io);
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    var d: ming.Diag = .{};
+    if (eng.clone("Warm up.", path, null, 0, &d)) |w| a.free(w) else |_| {}
 }
 
 fn runJob(eng: *ming.Engine, job: *Job) void {
