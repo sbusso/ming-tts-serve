@@ -65,6 +65,9 @@ pub const Sink = struct {
     /// Optional: called once before the first fragment (`done` 0) and after
     /// each fragment, on the engine's thread.
     progress: ?*const fn (ctx: ?*anyopaque, p: Progress) void = null,
+    /// Optional: polled before each fragment after the first. When it returns
+    /// true, generation stops and the audio made so far is returned.
+    cancelled: ?*const fn (ctx: ?*anyopaque) bool = null,
 };
 
 /// Generation progress. `units` are spoken units (words, CJK characters);
@@ -292,6 +295,7 @@ pub const Engine = struct {
         e.report(.{ .done = 0, .total = frags.items.len, .units_done = 0, .units_total = units_total, .audio_s = 0 });
         const last = frags.items.len - 1;
         for (frags.items, 0..) |f, i| {
+            if (i > 0 and e.isCancelled()) break;
             const frag = f.text;
             const chunk = try e.generateGuarded(req, frag, spk, prompt_latent, prompt_text, zero);
             defer a.free(chunk);
@@ -373,6 +377,12 @@ pub const Engine = struct {
             .paragraph => PAUSE_PARAGRAPH_S,
         };
         return base * std.math.clamp(e.pause_scale, 0, MAX_PAUSE_SCALE);
+    }
+
+    fn isCancelled(e: *Engine) bool {
+        const sink = e.on_chunk orelse return false;
+        const f = sink.cancelled orelse return false;
+        return f(sink.ctx);
     }
 
     fn report(e: *Engine, p: Progress) void {
