@@ -663,8 +663,13 @@ const DitStack = struct {
         var rot: Rotary = .{ .inv_freq = try t.get(prefix ++ ".rotary_embed.inv_freq", .{}) };
         try rot.precompute(a, s, seq_len);
         try t.extra.appendSlice(t.a, &rot.tab);
+        var cnt = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&cnt, &[_]c_int{1024}, 1, .int32, s));
+        try t.extra.append(t.a, cnt);
+        try evalAll(&.{cnt});
         const fb = try a.alloc(fused.Block, n);
         for (blocks, fb) |b, *f| f.* = .{
+            .cnt = cnt,
             .norm1 = b.norm1,
             .norm2 = b.norm2,
             .wq = b.q.w,
@@ -691,7 +696,7 @@ const DitStack = struct {
         if (L == st.rot.tab_len and fused.eligible(x, g.s) and mlx.mlx_array_dtype(st.fb[0].wq) == .bfloat16) {
             for (st.fb) |*b| {
                 const o = try fused.block(b, x, st.rot.tab[0], st.rot.tab[1], g.s);
-                for ([_]Arr{ o.qkv, o.x1, o.hh, o.x2 }) |y| _ = try g.keep(y);
+                for ([_]Arr{ o.qkv, o.att, o.x1, o.hh, o.x2 }) |y| _ = try g.keep(y);
                 x = o.x2;
             }
             return x;

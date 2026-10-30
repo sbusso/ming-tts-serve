@@ -155,6 +155,18 @@ pub fn main(init: std.process.Init) !void {
         if (m.cfm_compiled) |c| _ = mlx.mlx_closure_free(c);
         m.cfm_compiled = null;
         outs[k] = try cfm(m, z, hist, noise, sde); // trace + warm
+        // Determinism: 30 more samples must match the first bit for bit.
+        var mismatches: usize = 0;
+        const ref = try ming.toF32(a, outs[k], s);
+        defer a.free(ref);
+        for (0..30) |_| {
+            const y = try cfm(m, z, hist, noise, sde);
+            defer _ = mlx.mlx_array_free(y);
+            const yv = try ming.toF32(a, y, s);
+            defer a.free(yv);
+            if (!std.mem.eql(f32, yv, ref)) mismatches += 1;
+        }
+        std.debug.print("cfm MING_FUSED={s}: {d}/30 repeats differ from the first\n", .{ flag, mismatches });
         for (0..3) |_| _ = mlx.mlx_array_free(try cfm(m, z, hist, noise, sde));
         const t0 = now(io);
         for (0..iters) |_| _ = mlx.mlx_array_free(try cfm(m, z, hist, noise, sde));
@@ -267,7 +279,7 @@ pub fn main(init: std.process.Init) !void {
     const b = &m.dit.fb[0];
     const x = try g0.normal(&.{ 2, 3, 1024 }, .bfloat16);
     const blk = try fused.block(b, x, m.dit.rot.tab[0], m.dit.rot.tab[1], s);
-    const parts = [_]Arr{ blk.qkv, blk.x1, blk.hh, blk.x2 };
+    const parts = [_]Arr{ blk.qkv, blk.att, blk.x1, blk.hh, blk.x2 };
     try ming.evalAll(&parts);
     defer for (parts) |q| {
         _ = mlx.mlx_array_free(q);
@@ -284,7 +296,7 @@ pub fn main(init: std.process.Init) !void {
             // Round-robin over all 16 DiT blocks (384 MB): weights come from DRAM.
             for (&ys, 0..) |*y, yi| {
                 const bb = if (yi % 16 < 8) &m.dit.fb[yi % 8] else &m.agg.fb[yi % 8];
-                y.* = try g.keep(try fused.single(ki, bb, x, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+                y.* = try g.keep(try fused.single(ki, bb, x, blk.att, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
             }
             const t0 = now(io);
             try ming.evalAll(&ys);
@@ -305,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
                 const bb = if (hot) &m.dit.fb[0] else if (yi % 16 < 8) &m.dit.fb[yi % 8] else &m.agg.fb[yi % 8];
                 if (ki == 0) {
                     const o = try fused.block(bb, y, m.dit.rot.tab[0], m.dit.rot.tab[1], s);
-                    for ([_]Arr{ o.qkv, o.x1, o.hh }) |q| _ = try g.keep(q);
+                    for ([_]Arr{ o.qkv, o.att, o.x1, o.hh }) |q| _ = try g.keep(q);
                     y = try g.keep(o.x2);
                 } else if (ki == 4) { // A then B
                     const q = try g.keep(try fused.single(0, bb, y, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
@@ -313,7 +325,7 @@ pub fn main(init: std.process.Init) !void {
                 } else if (ki == 5) { // C then D
                     const h = try g.keep(try fused.single(2, bb, y, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
                     y = try g.keep(try fused.single(3, bb, y, blk.qkv, h, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
-                } else y = try g.keep(try fused.single(ki, bb, y, blk.qkv, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
+                } else y = try g.keep(try fused.single(ki, bb, y, blk.att, blk.hh, m.dit.rot.tab[0], m.dit.rot.tab[1], s));
             }
             const t0 = now(io);
             try ming.evalAll(&.{y});

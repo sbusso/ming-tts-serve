@@ -160,24 +160,37 @@ const SRC_QKV = PRELUDE ++
     \\    OUT[(which * R + r) * 1024 + col] = bfloat16_t(e);
     \\    OUT[(which * R + r) * 1024 + col + 1] = bfloat16_t(od);
     \\}
-;
-
-// B: attention + out linear + residual. Every threadgroup recomputes the
-// attention (16 heads × R queries × L keys, ~40K MACs) into threadgroup
-// memory as bf16 (MLX rounds the sdpa output there too): 8 lanes per
-// (query, head), 8 dims each. Two-pass softmax in f32 (MLX: online softmax).
-// Grid: 1024 / NO.
-const SRC_ATTN = PRELUDE ++
-    \\threadgroup bfloat16_t xs[R * 1024];
-    \\for (int c = int(t) >> 3; c < R * 16; c += 4 * SG) {
-    \\    const int r = c / 16, b = r / L, d = (c % 16) * 64 + (int(lane) & 7) * 8;
-    \\    const uint4 qv = *(const device uint4*)(QKV + r * 1024 + d);
-    \\    const float4 qa = 0.125f * bf4(qv.xy), qb = 0.125f * bf4(qv.zw);
+    \\// Per head h, the last threadgroup to finish h's q/k/v columns computes
+    \\// h's attention into ATT. Counters CNT[h] are never reset: every dispatch
+    \\// adds exactly NTG = 3 * 64 / NO to each.
+    \\threadgroup_barrier(mem_flags::mem_device);
+    \\threadgroup bool last;
+    \\if (t == 0) {
+    \\    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    \\    const uint old = atomic_fetch_add_explicit((device atomic_uint*)CNT + col0 / 64, 1u, memory_order_relaxed);
+    \\    last = old % uint(NTG) == uint(NTG - 1);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (!last) return;
+    \\atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    \\// Stage head h's q/k/v rows through atomic loads: they are served from
+    \\// the coherent L2, so no stale L1 line (MLX recycles buffers) is read.
+    \\threadgroup uint hq[3 * R * 32];
+    \\const int h = col0 / 64;
+    \\for (int u = int(t); u < 3 * R * 32; u += 32 * SG) {
+    \\    const int row = u / 32, w = u % 32;
+    \\    hq[u] = atomic_load_explicit((device atomic_uint*)(OUT + row * 1024 + h * 64) + w, memory_order_relaxed);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\#define HQ(row, d) bf4(uint2(hq[(row) * 32 + (d) / 2], hq[(row) * 32 + (d) / 2 + 1]))
+    \\for (int r = int(t) >> 3; r < R; r += 4 * SG) {
+    \\    const int b = r / L, d = (int(lane) & 7) * 8;
+    \\    const float4 qa = 0.125f * HQ(r, d), qb = 0.125f * HQ(r, d + 4);
     \\    float sc[L];
     \\    float m = -INFINITY;
     \\    for (int j = 0; j < L; j++) {
-    \\        const uint4 kv = *(const device uint4*)(QKV + (R + b * L + j) * 1024 + d);
-    \\        float v = dot(qa, bf4(kv.xy)) + dot(qb, bf4(kv.zw));
+    \\        const int kr = R + b * L + j;
+    \\        float v = dot(qa, HQ(kr, d)) + dot(qb, HQ(kr, d + 4));
     \\        v += simd_shuffle_xor(v, 1);
     \\        v += simd_shuffle_xor(v, 2);
     \\        v += simd_shuffle_xor(v, 4);
@@ -188,17 +201,19 @@ const SRC_ATTN = PRELUDE ++
     \\    float4 oa = 0.0f, oc = 0.0f;
     \\    for (int j = 0; j < L; j++) {
     \\        const float p = metal::exp(sc[j] - m);
-    \\        const uint4 vv = *(const device uint4*)(QKV + (2 * R + b * L + j) * 1024 + d);
-    \\        sum += p; oa += p * bf4(vv.xy); oc += p * bf4(vv.zw);
+    \\        const int vr = 2 * R + b * L + j;
+    \\        sum += p; oa += p * HQ(vr, d); oc += p * HQ(vr, d + 4);
     \\    }
     \\    for (int k = 0; k < 4; k++) {
-    \\        xs[r * 1024 + d + k] = bfloat16_t(oa[k] / sum);
-    \\        xs[r * 1024 + d + 4 + k] = bfloat16_t(oc[k] / sum);
+    \\        ATT[r * 1024 + h * 64 + d + k] = bfloat16_t(oa[k] / sum);
+    \\        ATT[r * 1024 + h * 64 + d + 4 + k] = bfloat16_t(oc[k] / sum);
     \\    }
     \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\
-++ gemv(1024, "WO + (ob + n) * 1024", "bf4(*(threadgroup const uint2*)(xs + r * 1024 + i))", false) ++
+;
+
+// B: out linear + residual on the attention output A left in ATT.
+// Grid: 1024 / NO.
+const SRC_ATTN = PRELUDE ++ gemv(1024, "WO + (ob + n) * 1024", "LDW(ATT, r * 1024 + i)", false) ++
     \\for (int e = int(t); e < NO * R; e += 32 * SG) {
     \\    const int n = e / R, r = e % R, o = ob + n;
     \\    OUT[r * 1024 + o] = bfloat16_t(float(X[r * 1024 + o]) + rb(rsum(n, r) + float(BO[o])));
@@ -409,8 +424,8 @@ const Kernel = struct {
     }
 };
 
-var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_A" };
-var k_attn: Kernel = .{ .name = "ming_dit_attn_out", .ins = &.{ "QKV", "X", "WO", "BO" }, .src = SRC_ATTN, .tile = .{ .no = 8, .sg = 8 }, .env = "MING_FT_B" };
+var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN", "CNT" }, .outs = &.{ "OUT", "ATT" }, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_A" };
+var k_attn: Kernel = .{ .name = "ming_dit_attn_out", .ins = &.{ "ATT", "X", "WO", "BO" }, .src = SRC_ATTN, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_B" };
 var k_ff1: Kernel = .{ .name = "ming_dit_ff1", .ins = &.{ "X", "NW", "W1", "B1" }, .src = SRC_FF1, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_C" };
 var k_ff2: Kernel = .{ .name = "ming_dit_ff2", .ins = &.{ "HH", "X", "W2", "B2" }, .src = SRC_FF2, .tile = .{ .no = 2, .sg = 4 }, .env = "MING_FT_D" };
 var k_embed: Kernel = .{ .name = "ming_cfm_embed", .ins = &.{ "Y", "WX", "BX", "TE", "CE", "XH" }, .src = SRC_EMBED };
@@ -476,6 +491,9 @@ pub const Block = struct {
     b1: Arr,
     w2: Arr,
     b2: Arr,
+    /// int32 [1024] (big enough to be bound as device memory) counter for A's last-threadgroup election, shared by
+    /// the blocks of one stack (zero at load; only ever incremented by A).
+    cnt: Arr,
 };
 
 /// Whether x [B, L, 1024] fits the fused DiT kernels.
@@ -485,7 +503,17 @@ pub fn eligible(x: Arr, s: S) bool {
     return sh.len == 3 and sh[2] == D and sh[0] * sh[1] <= MAX_ROWS and mlx.mlx_array_dtype(x) == .bfloat16;
 }
 
-pub const BlockOut = struct { qkv: Arr, x1: Arr, hh: Arr, x2: Arr };
+pub const BlockOut = struct { qkv: Arr, att: Arr, x1: Arr, hh: Arr, x2: Arr };
+
+fn qkvAtt(b: *const Block, x: Arr, cos: Arr, sin: Arr, t: []const Tmpl, s: S) ![2]Arr {
+    const sh = mlx.getShape(x);
+    const R = sh[0] * sh[1];
+    const tl = k_qkv.tile;
+    const ta: []const Tmpl = &.{ t[0], t[1], .{ "NTG", @divExact(3 * 64, tl.no) } };
+    var o: [2]Arr = undefined;
+    try runN(&k_qkv, &.{ x, b.norm1, b.wq, b.wk, b.wv, b.bq, b.bk, b.bv, cos, sin, b.cnt }, &.{ &.{ 3, R, D }, &.{ R, D } }, 3 * D, 0, 128, ta, s, &o);
+    return o;
+}
 
 /// One DiT block, 4 dispatches. Intermediates are returned so the caller's
 /// graph scope frees them; `x2` is the block output [B, L, 1024].
@@ -494,23 +522,30 @@ pub fn block(b: *const Block, x: Arr, cos: Arr, sin: Arr, s: S) !BlockOut {
     const L = sh[1];
     const R = sh[0] * L;
     const t: []const Tmpl = &.{ .{ "R", R }, .{ "L", L } };
-    const qkv = try run(&k_qkv, &.{ x, b.norm1, b.wq, b.wk, b.wv, b.bq, b.bk, b.bv, cos, sin }, &.{ 3, R, D }, 3 * D, 0, t, s);
-    errdefer _ = mlx.mlx_array_free(qkv);
-    const x1 = try run(&k_attn, &.{ qkv, x, b.wo, b.bo }, sh, D, 0, t, s);
+    const qa = try qkvAtt(b, x, cos, sin, t, s);
+    errdefer for (qa) |y| {
+        _ = mlx.mlx_array_free(y);
+    };
+    const x1 = try run(&k_attn, &.{ qa[1], x, b.wo, b.bo }, sh, D, 0, t, s);
     errdefer _ = mlx.mlx_array_free(x1);
     const hh = try run(&k_ff1, &.{ x1, b.norm2, b.w1, b.b1 }, &.{ R, FF }, FF, 0, t, s);
     errdefer _ = mlx.mlx_array_free(hh);
     const x2 = try run(&k_ff2, &.{ hh, x1, b.w2, b.b2 }, sh, D, 0, t, s);
-    return .{ .qkv = qkv, .x1 = x1, .hh = hh, .x2 = x2 };
+    return .{ .qkv = qa[0], .att = qa[1], .x1 = x1, .hh = hh, .x2 = x2 };
 }
 
-/// One kernel of `block` alone (0 = A .. 3 = D), for timing.
+/// One kernel of `block` alone (0 = A .. 3 = D), for timing. A returns its
+/// attention output (B's input); B takes it as `qkv`.
 pub fn single(which: usize, b: *const Block, x: Arr, qkv: Arr, hh: Arr, cos: Arr, sin: Arr, s: S) !Arr {
     const sh = mlx.getShape(x);
     const R = sh[0] * sh[1];
     const t: []const Tmpl = &.{ .{ "R", R }, .{ "L", sh[1] } };
     return switch (which) {
-        0 => run(&k_qkv, &.{ x, b.norm1, b.wq, b.wk, b.wv, b.bq, b.bk, b.bv, cos, sin }, &.{ 3, R, D }, 3 * D, 0, t, s),
+        0 => blk: {
+            const o = try qkvAtt(b, x, cos, sin, t, s);
+            _ = mlx.mlx_array_free(o[0]);
+            break :blk o[1];
+        },
         1 => run(&k_attn, &.{ qkv, x, b.wo, b.bo }, sh, D, 0, t, s),
         2 => run(&k_ff1, &.{ x, b.norm2, b.w1, b.b1 }, &.{ R, FF }, FF, 0, t, s),
         else => run(&k_ff2, &.{ hh, x, b.w2, b.b2 }, sh, D, 0, t, s),
