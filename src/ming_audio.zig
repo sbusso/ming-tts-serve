@@ -216,15 +216,15 @@ fn meanSquare(x: []const f32) f64 {
     return s / @as(f64, @floatFromInt(x.len));
 }
 
-/// Soft knee above 0.9: |x| > 0.9 maps to 0.9 + 0.1·tanh((|x| - 0.9) / 0.1),
-/// so output never reaches full scale and peaks round off instead of
+/// Soft knee above 0.9: |x| > 0.9 maps to 0.9 + 0.08·tanh((|x| - 0.9) / 0.08),
+/// so output stays under 0.98 (-0.2 dBFS) and peaks round off instead of
 /// clipping. Plain TTS (no reference) often peaks above 1.0, which the 16-bit
 /// WAV would otherwise hard-clip. Per sample, so streamed chunks match the
 /// full output. Departs from upstream, which writes the samples as is.
 pub fn softLimit(x: []f32) void {
     for (x) |*v| {
         const m = @abs(v.*);
-        if (m > 0.9) v.* = std.math.copysign(0.9 + 0.1 * std.math.tanh((m - 0.9) / 0.1), v.*);
+        if (m > 0.9) v.* = std.math.copysign(0.9 + 0.08 * std.math.tanh((m - 0.9) / 0.08), v.*);
     }
 }
 
