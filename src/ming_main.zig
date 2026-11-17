@@ -150,11 +150,9 @@ fn readRequest(a: Allocator, r: *std.Io.Reader) !HttpReq {
         if (buf.items.len > 64 * 1024) return error.HeadersTooLarge;
         var chunk: [4096]u8 = undefined;
         var bufs: [1][]u8 = .{&chunk};
-        const n = r.readVec(&bufs) catch |e| switch (e) {
-            error.EndOfStream => 0,
-            else => return e,
-        };
-        if (n == 0) return error.EndOfStream;
+        // readVec returning 0 does not mean end of stream (the bytes may have
+        // gone to the reader's own buffer); only error.EndOfStream does.
+        const n = try r.readVec(&bufs);
         try buf.appendSlice(a, chunk[0..n]);
         head_end = std.mem.indexOf(u8, buf.items, "\r\n\r\n");
     }
@@ -175,12 +173,17 @@ fn readRequest(a: Allocator, r: *std.Io.Reader) !HttpReq {
     const start = head_end.? + 4;
     while (buf.items.len < start + clen) {
         var chunk: [16384]u8 = undefined;
-        var bufs: [1][]u8 = .{&chunk};
+        // Never ask for more than the body still needs. readVec first hands
+        // out what the reader has buffered and then reads the socket again to
+        // fill the rest of the slice; with a slice larger than the remaining
+        // body that second read waits forever on a client that has sent the
+        // whole request and is waiting for the response.
+        const want = @min(chunk.len, start + clen - buf.items.len);
+        var bufs: [1][]u8 = .{chunk[0..want]};
         const n = r.readVec(&bufs) catch |e| switch (e) {
-            error.EndOfStream => 0,
+            error.EndOfStream => break,
             else => return e,
         };
-        if (n == 0) break;
         try buf.appendSlice(a, chunk[0..n]);
     }
     const end = @min(buf.items.len, start + clen);
